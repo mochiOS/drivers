@@ -86,6 +86,26 @@ const USB_DESC_TYPE_DEVICE: u16 = 1;
 const USB_DESC_TYPE_CONFIGURATION: u16 = 2;
 const USB_DESC_TYPE_INTERFACE: u8 = 4;
 const USB_DESC_TYPE_ENDPOINT: u8 = 5;
+const USB_DESC_TYPE_HID: u8 = 0x21;
+const USB_DESC_TYPE_REPORT: u16 = 0x22;
+
+#[derive(Clone, Copy)]
+struct InterruptEndpointInfo {
+    address: u8,
+    max_packet: u16,
+    interval: u8,
+}
+
+#[derive(Clone, Copy)]
+struct UsbConfigurationInfo {
+    config_value: u8,
+    interface_number: u8,
+    interface_class: u8,
+    interface_subclass: u8,
+    interface_protocol: u8,
+    report_descriptor_len: u16,
+    interrupt_in: Option<InterruptEndpointInfo>,
+}
 
 #[derive(Clone, Copy)]
 struct PciLocation {
@@ -673,6 +693,30 @@ fn queue_descriptor_read(
     );
 }
 
+fn queue_control_no_data(
+    ep0_ring: &DmaPage,
+    ring_state: &mut TransferRingState,
+    request_type: u8,
+    request: u8,
+    value: u16,
+    index: u16,
+) {
+    queue_transfer_trb(
+        ep0_ring,
+        ring_state,
+        build_setup_packet(request_type, request, value, index, 0),
+        8,
+        (XHCI_TRB_TYPE_SETUP_STAGE << 10) | XHCI_TRB_IDT | (2 << 16),
+    );
+    queue_transfer_trb(
+        ep0_ring,
+        ring_state,
+        0,
+        0,
+        (XHCI_TRB_TYPE_STATUS_STAGE << 10) | XHCI_TRB_IOC | XHCI_TRB_DIR_IN,
+    );
+}
+
 fn read_device_descriptor(
     mmio: &MmioRegion,
     dboff: u32,
@@ -700,6 +744,79 @@ fn read_device_descriptor(
     Some((vendor, product))
 }
 
+fn read_report_descriptor(
+    mmio: &MmioRegion,
+    dboff: u32,
+    rtsoff: u32,
+    event_ring: &DmaPage,
+    slot_id: u8,
+    ep0_ring: &DmaPage,
+    ring_state: &mut TransferRingState,
+    interface_number: u8,
+    report_len: u16,
+) -> bool {
+    let descriptor = match allocate_descriptor_page() {
+        Some(page) => page,
+        None => return false,
+    };
+    let transfer_length = report_len.min(descriptor.len as u16);
+    clear_event_trbs(event_ring);
+    queue_transfer_trb(
+        ep0_ring,
+        ring_state,
+        build_setup_packet(0x81, 0x06, USB_DESC_TYPE_REPORT << 8, interface_number as u16, transfer_length),
+        8,
+        (XHCI_TRB_TYPE_SETUP_STAGE << 10) | XHCI_TRB_IDT | (3 << 16),
+    );
+    queue_transfer_trb(
+        ep0_ring,
+        ring_state,
+        descriptor.phys,
+        transfer_length as u32,
+        (XHCI_TRB_TYPE_DATA_STAGE << 10) | XHCI_TRB_DIR_IN,
+    );
+    queue_transfer_trb(
+        ep0_ring,
+        ring_state,
+        0,
+        0,
+        (XHCI_TRB_TYPE_STATUS_STAGE << 10) | XHCI_TRB_IOC,
+    );
+    ring_doorbell(mmio, dboff, slot_id as u32, 1, 0);
+    let Some(completion) = wait_transfer_event(mmio, rtsoff, event_ring, slot_id) else {
+        return false;
+    };
+    if completion != XHCI_CC_SUCCESS {
+        platform::println!(
+            "usb-driver: get report descriptor failed completion={}",
+            completion
+        );
+        return false;
+    }
+
+    platform::println!(
+        "usb-driver: report descriptor length={}",
+        transfer_length
+    );
+    let preview_len = core::cmp::min(16usize, transfer_length as usize);
+    let mut line = [0u8; 3 * 16];
+    for i in 0..preview_len {
+        let byte = {
+            // SAFETY: descriptor page is valid DMA-backed memory and i is range-checked.
+            unsafe { read_volatile(descriptor.ptr().add(i) as *const u8) }
+        };
+        let hi = byte >> 4;
+        let lo = byte & 0x0f;
+        line[i * 3] = if hi < 10 { b'0' + hi } else { b'a' + (hi - 10) };
+        line[i * 3 + 1] = if lo < 10 { b'0' + lo } else { b'a' + (lo - 10) };
+        line[i * 3 + 2] = if i + 1 == preview_len { 0 } else { b' ' };
+    }
+    if let Ok(text) = core::str::from_utf8(&line[..preview_len * 3 - 1]) {
+        platform::println!("usb-driver: report descriptor bytes={}", text);
+    }
+    true
+}
+
 fn read_configuration_descriptor(
     mmio: &MmioRegion,
     dboff: u32,
@@ -708,10 +825,10 @@ fn read_configuration_descriptor(
     slot_id: u8,
     ep0_ring: &DmaPage,
     ring_state: &mut TransferRingState,
-) -> bool {
+) -> Option<UsbConfigurationInfo> {
     let descriptor = match allocate_descriptor_page() {
         Some(page) => page,
-        None => return false,
+        None => return None,
     };
 
     clear_event_trbs(event_ring);
@@ -724,14 +841,14 @@ fn read_configuration_descriptor(
     );
     ring_doorbell(mmio, dboff, slot_id as u32, 1, 0);
     let Some(completion) = wait_transfer_event(mmio, rtsoff, event_ring, slot_id) else {
-        return false;
+        return None;
     };
     if completion != XHCI_CC_SUCCESS {
         platform::println!(
             "usb-driver: get config header failed completion={}",
             completion
         );
-        return false;
+        return None;
     }
 
     let total_length = ((descriptor.read_u32(0) >> 16) & 0xffff) as u16;
@@ -747,18 +864,24 @@ fn read_configuration_descriptor(
     );
     ring_doorbell(mmio, dboff, slot_id as u32, 1, 0);
     let Some(completion) = wait_transfer_event(mmio, rtsoff, event_ring, slot_id) else {
-        return false;
+        return None;
     };
     if completion != XHCI_CC_SUCCESS {
         platform::println!(
             "usb-driver: get config descriptor failed completion={}",
             completion
         );
-        return false;
+        return None;
     }
 
     let config_value = ((descriptor.read_u32(4) >> 8) & 0xff) as u8;
     let interface_count = descriptor.read_u32(4) as u8;
+    let mut interface_number = 0u8;
+    let mut interface_class = 0u8;
+    let mut interface_subclass = 0u8;
+    let mut interface_protocol = 0u8;
+    let mut report_descriptor_len = 0u16;
+    let mut interrupt_in = None;
     platform::println!(
         "usb-driver: config descriptor total_length={} interfaces={} config_value={}",
         transfer_length,
@@ -790,6 +913,10 @@ fn read_configuration_descriptor(
                 let subclass = unsafe { read_volatile(bytes.add(offset + 6) as *const u8) };
                 // SAFETY: interface descriptor fields are inside validated descriptor bounds.
                 let proto = unsafe { read_volatile(bytes.add(offset + 7) as *const u8) };
+                interface_number = iface_num;
+                interface_class = class;
+                interface_subclass = subclass;
+                interface_protocol = proto;
                 platform::println!(
                     "usb-driver: interface num={} alt={} eps={} class=0x{:02x} subclass=0x{:02x} proto=0x{:02x}",
                     iface_num,
@@ -809,6 +936,13 @@ fn read_configuration_descriptor(
                 let max_packet = unsafe { read_volatile(bytes.add(offset + 4) as *const u16) };
                 // SAFETY: endpoint descriptor fields are inside validated descriptor bounds.
                 let interval = unsafe { read_volatile(bytes.add(offset + 6) as *const u8) };
+                if (addr & 0x80) != 0 && (attrs & 0x3) == 0x3 && interrupt_in.is_none() {
+                    interrupt_in = Some(InterruptEndpointInfo {
+                        address: addr,
+                        max_packet,
+                        interval,
+                    });
+                }
                 platform::println!(
                     "usb-driver: endpoint addr=0x{:02x} attrs=0x{:02x} max_packet={} interval={}",
                     addr,
@@ -817,11 +951,56 @@ fn read_configuration_descriptor(
                     interval
                 );
             }
+            USB_DESC_TYPE_HID if len >= 9 => {
+                // SAFETY: HID descriptor fields are inside validated descriptor bounds.
+                let report_len =
+                    unsafe { read_volatile(bytes.add(offset + 7) as *const u16) };
+                report_descriptor_len = report_len;
+                platform::println!(
+                    "usb-driver: hid descriptor report_len={}",
+                    report_len
+                );
+            }
             _ => {}
         }
         offset += len;
     }
 
+    Some(UsbConfigurationInfo {
+        config_value,
+        interface_number,
+        interface_class,
+        interface_subclass,
+        interface_protocol,
+        report_descriptor_len,
+        interrupt_in,
+    })
+}
+
+fn set_configuration(
+    mmio: &MmioRegion,
+    dboff: u32,
+    rtsoff: u32,
+    event_ring: &DmaPage,
+    slot_id: u8,
+    ep0_ring: &DmaPage,
+    ring_state: &mut TransferRingState,
+    config_value: u8,
+) -> bool {
+    clear_event_trbs(event_ring);
+    queue_control_no_data(ep0_ring, ring_state, 0x00, 0x09, config_value as u16, 0);
+    ring_doorbell(mmio, dboff, slot_id as u32, 1, 0);
+    let Some(completion) = wait_transfer_event(mmio, rtsoff, event_ring, slot_id) else {
+        return false;
+    };
+    if completion != XHCI_CC_SUCCESS {
+        platform::println!(
+            "usb-driver: set configuration failed completion={} value={}",
+            completion,
+            config_value
+        );
+        return false;
+    }
     true
 }
 
@@ -1150,7 +1329,7 @@ fn enumerate_xhci_controller(loc: PciLocation, bar: XhciBar, vendor: u16, device
                                 vendor_id,
                                 product_id
                             );
-                            if !read_configuration_descriptor(
+                            if let Some(config) = read_configuration_descriptor(
                                 &mmio,
                                 dboff,
                                 rtsoff,
@@ -1159,6 +1338,50 @@ fn enumerate_xhci_controller(loc: PciLocation, bar: XhciBar, vendor: u16, device
                                 &ep0_ring,
                                 &mut ep0_ring_state,
                             ) {
+                                if set_configuration(
+                                    &mmio,
+                                    dboff,
+                                    rtsoff,
+                                    &event_ring,
+                                    slot_id,
+                                    &ep0_ring,
+                                    &mut ep0_ring_state,
+                                    config.config_value,
+                                ) {
+                                    platform::println!(
+                                        "usb-driver: set configuration ok value={} class=0x{:02x} subclass=0x{:02x} proto=0x{:02x}",
+                                        config.config_value,
+                                        config.interface_class,
+                                        config.interface_subclass,
+                                        config.interface_protocol
+                                    );
+                                    if let Some(ep) = config.interrupt_in {
+                                        platform::println!(
+                                            "usb-driver: interrupt endpoint selected addr=0x{:02x} max_packet={} interval={}",
+                                            ep.address,
+                                            ep.max_packet,
+                                            ep.interval
+                                        );
+                                    }
+                                    if config.report_descriptor_len != 0 {
+                                        let _ = read_report_descriptor(
+                                            &mmio,
+                                            dboff,
+                                            rtsoff,
+                                            &event_ring,
+                                            slot_id,
+                                            &ep0_ring,
+                                            &mut ep0_ring_state,
+                                            config.interface_number,
+                                            config.report_descriptor_len,
+                                        );
+                                    }
+                                } else {
+                                    platform::println!(
+                                        "usb-driver: set configuration failed"
+                                    );
+                                }
+                            } else {
                                 platform::println!(
                                     "usb-driver: configuration descriptor read failed"
                                 );
