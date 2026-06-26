@@ -3,6 +3,7 @@
 extern crate alloc;
 
 use alloc::format;
+use core::mem::size_of;
 use core::ptr::{read_volatile, write_volatile};
 use mochi_user_platform as platform;
 use mochi_user_syscall as syscall;
@@ -27,9 +28,35 @@ const XHCI_CAP_RTSOFF: usize = 0x18;
 const XHCI_OP_USBCMD: usize = 0x00;
 const XHCI_OP_USBSTS: usize = 0x04;
 const XHCI_OP_PAGESIZE: usize = 0x08;
+const XHCI_OP_DNCTRL: usize = 0x14;
+const XHCI_OP_CRCR: usize = 0x18;
+const XHCI_OP_DCBAAP: usize = 0x30;
 const XHCI_OP_CONFIG: usize = 0x38;
 const XHCI_OP_PORTSC_BASE: usize = 0x400;
 const XHCI_OP_PORTSC_STRIDE: usize = 0x10;
+const XHCI_USBCMD_RUN: u32 = 1 << 0;
+const XHCI_USBCMD_HCRST: u32 = 1 << 1;
+const XHCI_USBSTS_HCHALTED: u32 = 1 << 0;
+const XHCI_USBSTS_CNR: u32 = 1 << 11;
+
+const XHCI_RT_IR0: usize = 0x20;
+const XHCI_IR_IMAN: usize = 0x00;
+const XHCI_IR_IMOD: usize = 0x04;
+const XHCI_IR_ERSTSZ: usize = 0x08;
+const XHCI_IR_ERSTBA: usize = 0x10;
+const XHCI_IR_ERDP: usize = 0x18;
+
+const XHCI_TRB_TYPE_LINK: u32 = 6;
+const XHCI_TRB_TYPE_ENABLE_SLOT: u32 = 9;
+const XHCI_TRB_TYPE_COMMAND_COMPLETION: u32 = 33;
+const XHCI_TRB_CYCLE: u32 = 1 << 0;
+const XHCI_TRB_TC: u32 = 1 << 1;
+const XHCI_CC_SUCCESS: u32 = 1;
+
+const XHCI_CTX_SIZE_64: u32 = 1 << 2;
+const XHCI_INPUT_CONTROL_DROP_FLAGS: usize = 0x00;
+const XHCI_INPUT_CONTROL_ADD_FLAGS: usize = 0x04;
+const XHCI_INPUT_CONTROL_CONFIG_VALUE: usize = 0x1c;
 
 #[derive(Clone, Copy)]
 struct PciLocation {
@@ -89,12 +116,268 @@ impl MmioRegion {
         unsafe { read_volatile((self.virt_base + offset) as *const u32) }
     }
 
+    fn read_u64(&self, offset: usize) -> u64 {
+        debug_assert!(offset + 8 <= self.len);
+        // SAFETY: MMIO region was explicitly mapped read/write for this process.
+        unsafe { read_volatile((self.virt_base + offset) as *const u64) }
+    }
+
     #[allow(dead_code)]
     fn write_u32(&self, offset: usize, value: u32) {
         debug_assert!(offset + 4 <= self.len);
         // SAFETY: MMIO region was explicitly mapped read/write for this process.
         unsafe { write_volatile((self.virt_base + offset) as *mut u32, value) }
     }
+
+    fn write_u64(&self, offset: usize, value: u64) {
+        debug_assert!(offset + 8 <= self.len);
+        // SAFETY: MMIO region was explicitly mapped read/write for this process.
+        unsafe { write_volatile((self.virt_base + offset) as *mut u64, value) }
+    }
+}
+
+struct DmaPage {
+    virt: u64,
+    phys: u64,
+    len: usize,
+}
+
+#[repr(align(4096))]
+struct Page4096([u8; 4096]);
+
+static mut XHCI_DCBAA_PAGE: Page4096 = Page4096([0; 4096]);
+static mut XHCI_COMMAND_RING_PAGE: Page4096 = Page4096([0; 4096]);
+static mut XHCI_EVENT_RING_PAGE: Page4096 = Page4096([0; 4096]);
+static mut XHCI_ERST_PAGE: Page4096 = Page4096([0; 4096]);
+static mut XHCI_OUTPUT_CTX_PAGE: Page4096 = Page4096([0; 4096]);
+static mut XHCI_INPUT_CTX_PAGE: Page4096 = Page4096([0; 4096]);
+
+impl DmaPage {
+    fn from_static(page: *mut Page4096) -> Result<Self, syscall::SysError> {
+        let virt = page.cast::<u8>() as u64;
+        let phys = platform::memory::get_physical_addr(virt)?;
+        Ok(Self {
+            virt,
+            phys,
+            len: 4096,
+        })
+    }
+
+    fn ptr(&self) -> *mut u8 {
+        self.virt as *mut u8
+    }
+
+    fn write_u32(&self, offset: usize, value: u32) {
+        debug_assert!(offset + 4 <= self.len);
+        // SAFETY: DMA page is mapped writable in this process.
+        unsafe { write_volatile(self.ptr().add(offset) as *mut u32, value) }
+    }
+
+    fn write_u64(&self, offset: usize, value: u64) {
+        debug_assert!(offset + 8 <= self.len);
+        // SAFETY: DMA page is mapped writable in this process.
+        unsafe { write_volatile(self.ptr().add(offset) as *mut u64, value) }
+    }
+
+    fn read_u32(&self, offset: usize) -> u32 {
+        debug_assert!(offset + 4 <= self.len);
+        // SAFETY: DMA page is mapped readable in this process.
+        unsafe { read_volatile(self.ptr().add(offset) as *const u32) }
+    }
+
+    fn zero(&self) {
+        // SAFETY: DMA page is mapped writable in this process.
+        unsafe { core::ptr::write_bytes(self.ptr(), 0, self.len) }
+    }
+}
+
+#[repr(C, align(16))]
+#[derive(Clone, Copy, Default)]
+struct Trb {
+    parameter: u64,
+    status: u32,
+    control: u32,
+}
+
+fn wait_until(label: &str, limit: usize, mut pred: impl FnMut() -> bool) -> bool {
+    for _ in 0..limit {
+        if pred() {
+            return true;
+        }
+        platform::thread::yield_now();
+    }
+    platform::println!("usb-driver: timeout waiting for {}", label);
+    false
+}
+
+fn xhci_stop_and_reset(mmio: &MmioRegion, cap_length: usize) -> bool {
+    let mut usbcmd = mmio.read_u32(cap_length + XHCI_OP_USBCMD);
+    if (usbcmd & XHCI_USBCMD_RUN) != 0 {
+        usbcmd &= !XHCI_USBCMD_RUN;
+        mmio.write_u32(cap_length + XHCI_OP_USBCMD, usbcmd);
+    }
+    if !wait_until("xhci halt", 100_000, || {
+        (mmio.read_u32(cap_length + XHCI_OP_USBSTS) & XHCI_USBSTS_HCHALTED) != 0
+    }) {
+        return false;
+    }
+
+    mmio.write_u32(
+        cap_length + XHCI_OP_USBCMD,
+        mmio.read_u32(cap_length + XHCI_OP_USBCMD) | XHCI_USBCMD_HCRST,
+    );
+    if !wait_until("xhci reset clear", 100_000, || {
+        (mmio.read_u32(cap_length + XHCI_OP_USBCMD) & XHCI_USBCMD_HCRST) == 0
+    }) {
+        return false;
+    }
+    wait_until("xhci controller ready", 100_000, || {
+        (mmio.read_u32(cap_length + XHCI_OP_USBSTS) & XHCI_USBSTS_CNR) == 0
+    })
+}
+
+fn xhci_start(mmio: &MmioRegion, cap_length: usize) -> bool {
+    mmio.write_u32(
+        cap_length + XHCI_OP_USBCMD,
+        mmio.read_u32(cap_length + XHCI_OP_USBCMD) | XHCI_USBCMD_RUN,
+    );
+    wait_until("xhci run", 100_000, || {
+        (mmio.read_u32(cap_length + XHCI_OP_USBSTS) & XHCI_USBSTS_HCHALTED) == 0
+    })
+}
+
+fn init_command_and_event_rings(
+    mmio: &MmioRegion,
+    cap_length: usize,
+    rtsoff: u32,
+) -> Result<(DmaPage, DmaPage, DmaPage, DmaPage), syscall::SysError> {
+    let dcbaa = {
+        DmaPage::from_static(&raw mut XHCI_DCBAA_PAGE)?
+    };
+    let command_ring = {
+        DmaPage::from_static(&raw mut XHCI_COMMAND_RING_PAGE)?
+    };
+    let event_ring = {
+        DmaPage::from_static(&raw mut XHCI_EVENT_RING_PAGE)?
+    };
+    let erst = {
+        DmaPage::from_static(&raw mut XHCI_ERST_PAGE)?
+    };
+
+    dcbaa.zero();
+    command_ring.zero();
+    event_ring.zero();
+    erst.zero();
+
+    let trb_count = command_ring.len / size_of::<Trb>();
+    let link_offset = (trb_count - 1) * size_of::<Trb>();
+    command_ring.write_u64(link_offset, command_ring.phys);
+    command_ring.write_u32(link_offset + 8, 0);
+    command_ring.write_u32(
+        link_offset + 12,
+        (XHCI_TRB_TYPE_LINK << 10) | XHCI_TRB_TC | XHCI_TRB_CYCLE,
+    );
+
+    erst.write_u64(0, event_ring.phys);
+    erst.write_u32(8, (event_ring.len / size_of::<Trb>()) as u32);
+    erst.write_u32(12, 0);
+
+    mmio.write_u64(cap_length + XHCI_OP_DCBAAP, dcbaa.phys);
+    mmio.write_u64(cap_length + XHCI_OP_CRCR, command_ring.phys | 1);
+    mmio.write_u32(cap_length + XHCI_OP_DNCTRL, 0);
+    mmio.write_u32(cap_length + XHCI_OP_CONFIG, 1);
+
+    let ir0 = rtsoff as usize + XHCI_RT_IR0;
+    mmio.write_u32(ir0 + XHCI_IR_IMAN, 0);
+    mmio.write_u32(ir0 + XHCI_IR_IMOD, 0);
+    mmio.write_u32(ir0 + XHCI_IR_ERSTSZ, 1);
+    mmio.write_u64(ir0 + XHCI_IR_ERSTBA, erst.phys);
+    mmio.write_u64(ir0 + XHCI_IR_ERDP, event_ring.phys);
+
+    Ok((dcbaa, command_ring, event_ring, erst))
+}
+
+fn ring_host_doorbell(mmio: &MmioRegion, dboff: u32, target: u32, stream_id: u16) {
+    mmio.write_u32(dboff as usize, target | ((stream_id as u32) << 16));
+}
+
+fn wait_command_completion(
+    event_ring: &DmaPage,
+    expected_type: u32,
+) -> Option<(u32, u8)> {
+    wait_until("command completion", 100_000, || {
+        (event_ring.read_u32(12) & XHCI_TRB_CYCLE) != 0
+    });
+    let control = event_ring.read_u32(12);
+    if (control & XHCI_TRB_CYCLE) == 0 {
+        return None;
+    }
+    let trb_type = (control >> 10) & 0x3f;
+    if trb_type != expected_type {
+        return None;
+    }
+    let status = event_ring.read_u32(8);
+    let completion_code = (status >> 24) & 0xff;
+    let slot_id = ((control >> 24) & 0xff) as u8;
+    Some((completion_code, slot_id))
+}
+
+fn enable_slot(
+    mmio: &MmioRegion,
+    dboff: u32,
+    command_ring: &DmaPage,
+    event_ring: &DmaPage,
+) -> Option<u8> {
+    command_ring.write_u64(0, 0);
+    command_ring.write_u32(8, 0);
+    command_ring.write_u32(12, (XHCI_TRB_TYPE_ENABLE_SLOT << 10) | XHCI_TRB_CYCLE);
+    ring_host_doorbell(mmio, dboff, 0, 0);
+    let (completion, slot_id) =
+        wait_command_completion(event_ring, XHCI_TRB_TYPE_COMMAND_COMPLETION)?;
+    if completion != XHCI_CC_SUCCESS || slot_id == 0 {
+        platform::println!(
+            "usb-driver: enable slot failed completion={} slot_id={}",
+            completion,
+            slot_id
+        );
+        return None;
+    }
+    Some(slot_id)
+}
+
+fn init_slot_contexts(
+    dcbaa: &DmaPage,
+    hccparams1: u32,
+    slot_id: u8,
+) -> Result<(DmaPage, DmaPage), syscall::SysError> {
+    let output_ctx = {
+        DmaPage::from_static(&raw mut XHCI_OUTPUT_CTX_PAGE)?
+    };
+    let input_ctx = {
+        DmaPage::from_static(&raw mut XHCI_INPUT_CTX_PAGE)?
+    };
+    output_ctx.zero();
+    input_ctx.zero();
+
+    let context_size = if (hccparams1 & XHCI_CTX_SIZE_64) != 0 {
+        64usize
+    } else {
+        32usize
+    };
+
+    dcbaa.write_u64(slot_id as usize * 8, output_ctx.phys);
+    input_ctx.write_u32(XHCI_INPUT_CONTROL_DROP_FLAGS, 0);
+    input_ctx.write_u32(XHCI_INPUT_CONTROL_ADD_FLAGS, 0x3);
+    input_ctx.write_u32(XHCI_INPUT_CONTROL_CONFIG_VALUE, 0);
+    platform::println!(
+        "usb-driver: slot {} contexts initialized ctx_size={} output=0x{:016x} input=0x{:016x}",
+        slot_id,
+        context_size,
+        output_ctx.phys,
+        input_ctx.phys
+    );
+
+    Ok((output_ctx, input_ctx))
 }
 
 fn port_in(port: u16, width: u64) -> Result<u64, syscall::SysError> {
@@ -306,6 +589,33 @@ fn enumerate_xhci_controller(loc: PciLocation, bar: XhciBar, vendor: u16, device
         pagesize,
         config
     );
+
+    if !xhci_stop_and_reset(&mmio, cap_length) {
+        platform::println!("usb-driver: xhci reset failed");
+        return;
+    }
+    let Ok((dcbaa, command_ring, event_ring, _erst)) =
+        init_command_and_event_rings(&mmio, cap_length, rtsoff)
+    else {
+        platform::println!("usb-driver: xhci ring initialization failed");
+        return;
+    };
+    platform::println!(
+        "usb-driver: command ring=0x{:016x} event ring=0x{:016x} dcbaa=0x{:016x}",
+        command_ring.phys,
+        event_ring.phys,
+        dcbaa.phys
+    );
+    if !xhci_start(&mmio, cap_length) {
+        platform::println!("usb-driver: xhci start failed");
+        return;
+    }
+    if let Some(slot_id) = enable_slot(&mmio, dboff, &command_ring, &event_ring) {
+        platform::println!("usb-driver: enable slot ok slot_id={}", slot_id);
+        let _ = init_slot_contexts(&dcbaa, hccparams1, slot_id);
+    } else {
+        platform::println!("usb-driver: enable slot timed out or failed");
+    }
 
     for port_index in 0..max_ports as usize {
         let offset = cap_length + XHCI_OP_PORTSC_BASE + port_index * XHCI_OP_PORTSC_STRIDE;
