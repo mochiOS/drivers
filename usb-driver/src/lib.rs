@@ -82,6 +82,10 @@ const XHCI_PORTSC_SPEED_SHIFT: u32 = 10;
 const XHCI_PORTSC_SPEED_MASK: u32 = 0xF << XHCI_PORTSC_SPEED_SHIFT;
 const XHCI_PORTSC_CHANGE_BITS: u32 =
     (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20) | (1 << 21) | (1 << 22) | (1 << 23);
+const USB_DESC_TYPE_DEVICE: u16 = 1;
+const USB_DESC_TYPE_CONFIGURATION: u16 = 2;
+const USB_DESC_TYPE_INTERFACE: u8 = 4;
+const USB_DESC_TYPE_ENDPOINT: u8 = 5;
 
 #[derive(Clone, Copy)]
 struct PciLocation {
@@ -619,25 +623,37 @@ fn address_device(
     true
 }
 
-fn read_device_descriptor(
-    mmio: &MmioRegion,
-    dboff: u32,
-    rtsoff: u32,
-    event_ring: &DmaPage,
-    slot_id: u8,
-    ep0_ring: &DmaPage,
-    ring_state: &mut TransferRingState,
-) -> Option<(u16, u16)> {
+fn build_setup_packet(
+    request_type: u8,
+    request: u8,
+    value: u16,
+    index: u16,
+    length: u16,
+) -> u64 {
+    u64::from(request_type)
+        | (u64::from(request) << 8)
+        | (u64::from(value) << 16)
+        | (u64::from(index) << 32)
+        | (u64::from(length) << 48)
+}
+
+fn allocate_descriptor_page() -> Option<DmaPage> {
     let descriptor = DmaPage::from_static(&raw mut XHCI_DESCRIPTOR_PAGE).ok()?;
     descriptor.zero();
-    clear_event_trbs(event_ring);
+    Some(descriptor)
+}
 
-    let setup_packet =
-        0x0012_0000_0100_0680u64; // GET_DESCRIPTOR(Device, index=0, length=18), bmRequestType=0x80
+fn queue_descriptor_read(
+    ep0_ring: &DmaPage,
+    ring_state: &mut TransferRingState,
+    descriptor: &DmaPage,
+    descriptor_type: u16,
+    length: u16,
+) {
     queue_transfer_trb(
         ep0_ring,
         ring_state,
-        setup_packet,
+        build_setup_packet(0x80, 0x06, descriptor_type << 8, 0, length),
         8,
         (XHCI_TRB_TYPE_SETUP_STAGE << 10) | XHCI_TRB_IDT | (3 << 16),
     );
@@ -645,7 +661,7 @@ fn read_device_descriptor(
         ep0_ring,
         ring_state,
         descriptor.phys,
-        18,
+        length as u32,
         (XHCI_TRB_TYPE_DATA_STAGE << 10) | XHCI_TRB_DIR_IN,
     );
     queue_transfer_trb(
@@ -655,11 +671,25 @@ fn read_device_descriptor(
         0,
         (XHCI_TRB_TYPE_STATUS_STAGE << 10) | XHCI_TRB_IOC,
     );
+}
+
+fn read_device_descriptor(
+    mmio: &MmioRegion,
+    dboff: u32,
+    rtsoff: u32,
+    event_ring: &DmaPage,
+    slot_id: u8,
+    ep0_ring: &DmaPage,
+    ring_state: &mut TransferRingState,
+) -> Option<(u16, u16)> {
+    let descriptor = allocate_descriptor_page()?;
+    clear_event_trbs(event_ring);
+    queue_descriptor_read(ep0_ring, ring_state, &descriptor, USB_DESC_TYPE_DEVICE, 18);
     ring_doorbell(mmio, dboff, slot_id as u32, 1, 0);
     let completion = wait_transfer_event(mmio, rtsoff, event_ring, slot_id)?;
     if completion != XHCI_CC_SUCCESS {
         platform::println!(
-            "usb-driver: get descriptor transfer failed completion={}",
+            "usb-driver: get device descriptor transfer failed completion={}",
             completion
         );
         return None;
@@ -668,6 +698,131 @@ fn read_device_descriptor(
     let vendor = descriptor.read_u32(8) as u16;
     let product = (descriptor.read_u32(8) >> 16) as u16;
     Some((vendor, product))
+}
+
+fn read_configuration_descriptor(
+    mmio: &MmioRegion,
+    dboff: u32,
+    rtsoff: u32,
+    event_ring: &DmaPage,
+    slot_id: u8,
+    ep0_ring: &DmaPage,
+    ring_state: &mut TransferRingState,
+) -> bool {
+    let descriptor = match allocate_descriptor_page() {
+        Some(page) => page,
+        None => return false,
+    };
+
+    clear_event_trbs(event_ring);
+    queue_descriptor_read(
+        ep0_ring,
+        ring_state,
+        &descriptor,
+        USB_DESC_TYPE_CONFIGURATION,
+        9,
+    );
+    ring_doorbell(mmio, dboff, slot_id as u32, 1, 0);
+    let Some(completion) = wait_transfer_event(mmio, rtsoff, event_ring, slot_id) else {
+        return false;
+    };
+    if completion != XHCI_CC_SUCCESS {
+        platform::println!(
+            "usb-driver: get config header failed completion={}",
+            completion
+        );
+        return false;
+    }
+
+    let total_length = ((descriptor.read_u32(0) >> 16) & 0xffff) as u16;
+    let transfer_length = total_length.min(descriptor.len as u16);
+    descriptor.zero();
+    clear_event_trbs(event_ring);
+    queue_descriptor_read(
+        ep0_ring,
+        ring_state,
+        &descriptor,
+        USB_DESC_TYPE_CONFIGURATION,
+        transfer_length,
+    );
+    ring_doorbell(mmio, dboff, slot_id as u32, 1, 0);
+    let Some(completion) = wait_transfer_event(mmio, rtsoff, event_ring, slot_id) else {
+        return false;
+    };
+    if completion != XHCI_CC_SUCCESS {
+        platform::println!(
+            "usb-driver: get config descriptor failed completion={}",
+            completion
+        );
+        return false;
+    }
+
+    let config_value = ((descriptor.read_u32(4) >> 8) & 0xff) as u8;
+    let interface_count = descriptor.read_u32(4) as u8;
+    platform::println!(
+        "usb-driver: config descriptor total_length={} interfaces={} config_value={}",
+        transfer_length,
+        interface_count,
+        config_value
+    );
+
+    let bytes = descriptor.ptr();
+    let mut offset = 0usize;
+    while offset + 2 <= transfer_length as usize {
+        // SAFETY: descriptor buffer is DMA-backed page owned by this process; bounds checked above.
+        let len = unsafe { read_volatile(bytes.add(offset) as *const u8) } as usize;
+        if len < 2 || offset + len > transfer_length as usize {
+            break;
+        }
+        // SAFETY: descriptor buffer is DMA-backed page owned by this process; bounds checked above.
+        let dtype = unsafe { read_volatile(bytes.add(offset + 1) as *const u8) };
+        match dtype {
+            USB_DESC_TYPE_INTERFACE if len >= 9 => {
+                // SAFETY: interface descriptor fields are inside validated descriptor bounds.
+                let iface_num = unsafe { read_volatile(bytes.add(offset + 2) as *const u8) };
+                // SAFETY: interface descriptor fields are inside validated descriptor bounds.
+                let alt = unsafe { read_volatile(bytes.add(offset + 3) as *const u8) };
+                // SAFETY: interface descriptor fields are inside validated descriptor bounds.
+                let eps = unsafe { read_volatile(bytes.add(offset + 4) as *const u8) };
+                // SAFETY: interface descriptor fields are inside validated descriptor bounds.
+                let class = unsafe { read_volatile(bytes.add(offset + 5) as *const u8) };
+                // SAFETY: interface descriptor fields are inside validated descriptor bounds.
+                let subclass = unsafe { read_volatile(bytes.add(offset + 6) as *const u8) };
+                // SAFETY: interface descriptor fields are inside validated descriptor bounds.
+                let proto = unsafe { read_volatile(bytes.add(offset + 7) as *const u8) };
+                platform::println!(
+                    "usb-driver: interface num={} alt={} eps={} class=0x{:02x} subclass=0x{:02x} proto=0x{:02x}",
+                    iface_num,
+                    alt,
+                    eps,
+                    class,
+                    subclass,
+                    proto
+                );
+            }
+            USB_DESC_TYPE_ENDPOINT if len >= 7 => {
+                // SAFETY: endpoint descriptor fields are inside validated descriptor bounds.
+                let addr = unsafe { read_volatile(bytes.add(offset + 2) as *const u8) };
+                // SAFETY: endpoint descriptor fields are inside validated descriptor bounds.
+                let attrs = unsafe { read_volatile(bytes.add(offset + 3) as *const u8) };
+                // SAFETY: endpoint descriptor fields are inside validated descriptor bounds.
+                let max_packet = unsafe { read_volatile(bytes.add(offset + 4) as *const u16) };
+                // SAFETY: endpoint descriptor fields are inside validated descriptor bounds.
+                let interval = unsafe { read_volatile(bytes.add(offset + 6) as *const u8) };
+                platform::println!(
+                    "usb-driver: endpoint addr=0x{:02x} attrs=0x{:02x} max_packet={} interval={}",
+                    addr,
+                    attrs,
+                    max_packet,
+                    interval
+                );
+            }
+            _ => {}
+        }
+        offset += len;
+    }
+
+    true
 }
 
 fn reset_port(mmio: &MmioRegion, port_offset: usize, port_index: usize) -> Option<u32> {
@@ -995,6 +1150,19 @@ fn enumerate_xhci_controller(loc: PciLocation, bar: XhciBar, vendor: u16, device
                                 vendor_id,
                                 product_id
                             );
+                            if !read_configuration_descriptor(
+                                &mmio,
+                                dboff,
+                                rtsoff,
+                                &event_ring,
+                                slot_id,
+                                &ep0_ring,
+                                &mut ep0_ring_state,
+                            ) {
+                                platform::println!(
+                                    "usb-driver: configuration descriptor read failed"
+                                );
+                            }
                         } else {
                             platform::println!("usb-driver: device descriptor read failed");
                         }
