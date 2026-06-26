@@ -48,6 +48,7 @@ const XHCI_IR_ERDP: usize = 0x18;
 
 const XHCI_TRB_TYPE_LINK: u32 = 6;
 const XHCI_TRB_TYPE_ENABLE_SLOT: u32 = 9;
+const XHCI_TRB_TYPE_ADDRESS_DEVICE: u32 = 11;
 const XHCI_TRB_TYPE_COMMAND_COMPLETION: u32 = 33;
 const XHCI_TRB_CYCLE: u32 = 1 << 0;
 const XHCI_TRB_TC: u32 = 1 << 1;
@@ -57,6 +58,23 @@ const XHCI_CTX_SIZE_64: u32 = 1 << 2;
 const XHCI_INPUT_CONTROL_DROP_FLAGS: usize = 0x00;
 const XHCI_INPUT_CONTROL_ADD_FLAGS: usize = 0x04;
 const XHCI_INPUT_CONTROL_CONFIG_VALUE: usize = 0x1c;
+const XHCI_SLOT_CTX_DW0: usize = 0x00;
+const XHCI_SLOT_CTX_DW1: usize = 0x04;
+const XHCI_EP_CTX_DW0: usize = 0x00;
+const XHCI_EP_CTX_DW1: usize = 0x04;
+const XHCI_EP_CTX_TR_DEQUEUE_LO: usize = 0x08;
+const XHCI_EP_CTX_TR_DEQUEUE_HI: usize = 0x0c;
+const XHCI_EP_CTX_DW4: usize = 0x10;
+const XHCI_EP_TYPE_CONTROL_BIDIR: u32 = 4;
+const XHCI_PORTSC_CCS: u32 = 1 << 0;
+const XHCI_PORTSC_PED: u32 = 1 << 1;
+const XHCI_PORTSC_OCA: u32 = 1 << 3;
+const XHCI_PORTSC_PR: u32 = 1 << 4;
+const XHCI_PORTSC_PP: u32 = 1 << 9;
+const XHCI_PORTSC_SPEED_SHIFT: u32 = 10;
+const XHCI_PORTSC_SPEED_MASK: u32 = 0xF << XHCI_PORTSC_SPEED_SHIFT;
+const XHCI_PORTSC_CHANGE_BITS: u32 =
+    (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20) | (1 << 21) | (1 << 22) | (1 << 23);
 
 #[derive(Clone, Copy)]
 struct PciLocation {
@@ -151,6 +169,7 @@ static mut XHCI_EVENT_RING_PAGE: Page4096 = Page4096([0; 4096]);
 static mut XHCI_ERST_PAGE: Page4096 = Page4096([0; 4096]);
 static mut XHCI_OUTPUT_CTX_PAGE: Page4096 = Page4096([0; 4096]);
 static mut XHCI_INPUT_CTX_PAGE: Page4096 = Page4096([0; 4096]);
+static mut XHCI_EP0_RING_PAGE: Page4096 = Page4096([0; 4096]);
 
 impl DmaPage {
     fn from_static(page: *mut Page4096) -> Result<Self, syscall::SysError> {
@@ -302,29 +321,55 @@ fn ring_host_doorbell(mmio: &MmioRegion, dboff: u32, target: u32, stream_id: u16
 }
 
 fn wait_command_completion(
+    mmio: &MmioRegion,
+    rtsoff: u32,
     event_ring: &DmaPage,
     expected_type: u32,
 ) -> Option<(u32, u8)> {
+    let trb_size = size_of::<Trb>();
+    let event_count = event_ring.len / trb_size;
     wait_until("command completion", 100_000, || {
-        (event_ring.read_u32(12) & XHCI_TRB_CYCLE) != 0
+        for idx in 0..event_count {
+            let control = event_ring.read_u32(idx * trb_size + 12);
+            if (control & XHCI_TRB_CYCLE) != 0 {
+                return true;
+            }
+        }
+        false
     });
-    let control = event_ring.read_u32(12);
-    if (control & XHCI_TRB_CYCLE) == 0 {
-        return None;
+
+    let mut completion = None;
+    let mut consumed = 0usize;
+    for idx in 0..event_count {
+        let offset = idx * trb_size;
+        let control = event_ring.read_u32(offset + 12);
+        if (control & XHCI_TRB_CYCLE) == 0 {
+            continue;
+        }
+        consumed = idx + 1;
+        let trb_type = (control >> 10) & 0x3f;
+        if trb_type == expected_type {
+            let status = event_ring.read_u32(offset + 8);
+            let completion_code = (status >> 24) & 0xff;
+            let slot_id = ((control >> 24) & 0xff) as u8;
+            completion = Some((completion_code, slot_id));
+        }
+        event_ring.write_u32(offset + 12, 0);
     }
-    let trb_type = (control >> 10) & 0x3f;
-    if trb_type != expected_type {
-        return None;
+
+    if consumed != 0 {
+        let next_offset = if consumed >= event_count { 0 } else { consumed * trb_size };
+        let ir0 = rtsoff as usize + XHCI_RT_IR0;
+        mmio.write_u64(ir0 + XHCI_IR_ERDP, event_ring.phys + next_offset as u64);
     }
-    let status = event_ring.read_u32(8);
-    let completion_code = (status >> 24) & 0xff;
-    let slot_id = ((control >> 24) & 0xff) as u8;
-    Some((completion_code, slot_id))
+
+    completion
 }
 
 fn enable_slot(
     mmio: &MmioRegion,
     dboff: u32,
+    rtsoff: u32,
     command_ring: &DmaPage,
     event_ring: &DmaPage,
 ) -> Option<u8> {
@@ -333,7 +378,7 @@ fn enable_slot(
     command_ring.write_u32(12, (XHCI_TRB_TYPE_ENABLE_SLOT << 10) | XHCI_TRB_CYCLE);
     ring_host_doorbell(mmio, dboff, 0, 0);
     let (completion, slot_id) =
-        wait_command_completion(event_ring, XHCI_TRB_TYPE_COMMAND_COMPLETION)?;
+        wait_command_completion(mmio, rtsoff, event_ring, XHCI_TRB_TYPE_COMMAND_COMPLETION)?;
     if completion != XHCI_CC_SUCCESS || slot_id == 0 {
         platform::println!(
             "usb-driver: enable slot failed completion={} slot_id={}",
@@ -345,39 +390,135 @@ fn enable_slot(
     Some(slot_id)
 }
 
+fn init_transfer_ring(ring: &DmaPage) {
+    ring.zero();
+    let trb_count = ring.len / size_of::<Trb>();
+    let link_offset = (trb_count - 1) * size_of::<Trb>();
+    ring.write_u64(link_offset, ring.phys);
+    ring.write_u32(link_offset + 8, 0);
+    ring.write_u32(
+        link_offset + 12,
+        (XHCI_TRB_TYPE_LINK << 10) | XHCI_TRB_TC | XHCI_TRB_CYCLE,
+    );
+}
+
 fn init_slot_contexts(
     dcbaa: &DmaPage,
     hccparams1: u32,
     slot_id: u8,
-) -> Result<(DmaPage, DmaPage), syscall::SysError> {
+    root_port: u8,
+    speed_id: u32,
+) -> Result<(DmaPage, DmaPage, DmaPage), syscall::SysError> {
     let output_ctx = {
         DmaPage::from_static(&raw mut XHCI_OUTPUT_CTX_PAGE)?
     };
     let input_ctx = {
         DmaPage::from_static(&raw mut XHCI_INPUT_CTX_PAGE)?
     };
+    let ep0_ring = {
+        DmaPage::from_static(&raw mut XHCI_EP0_RING_PAGE)?
+    };
     output_ctx.zero();
     input_ctx.zero();
+    init_transfer_ring(&ep0_ring);
 
     let context_size = if (hccparams1 & XHCI_CTX_SIZE_64) != 0 {
         64usize
     } else {
         32usize
     };
+    let ep0_max_packet_size = match speed_id {
+        3 => 64u32,
+        4 | 5 => 512u32,
+        _ => 8u32,
+    };
+    let slot_ctx = context_size;
+    let ep0_ctx = context_size * 2;
 
     dcbaa.write_u64(slot_id as usize * 8, output_ctx.phys);
     input_ctx.write_u32(XHCI_INPUT_CONTROL_DROP_FLAGS, 0);
     input_ctx.write_u32(XHCI_INPUT_CONTROL_ADD_FLAGS, 0x3);
     input_ctx.write_u32(XHCI_INPUT_CONTROL_CONFIG_VALUE, 0);
+    input_ctx.write_u32(
+        slot_ctx + XHCI_SLOT_CTX_DW0,
+        ((speed_id & 0xF) << 20) | (1 << 27),
+    );
+    input_ctx.write_u32(
+        slot_ctx + XHCI_SLOT_CTX_DW1,
+        (root_port as u32) << 16,
+    );
+    input_ctx.write_u32(ep0_ctx + XHCI_EP_CTX_DW0, 0);
+    input_ctx.write_u32(
+        ep0_ctx + XHCI_EP_CTX_DW1,
+        (3 << 1) | (XHCI_EP_TYPE_CONTROL_BIDIR << 3) | (ep0_max_packet_size << 16),
+    );
+    input_ctx.write_u64(ep0_ctx + XHCI_EP_CTX_TR_DEQUEUE_LO, ep0_ring.phys | 1);
+    input_ctx.write_u32(ep0_ctx + XHCI_EP_CTX_DW4, 8);
     platform::println!(
-        "usb-driver: slot {} contexts initialized ctx_size={} output=0x{:016x} input=0x{:016x}",
+        "usb-driver: slot {} contexts initialized ctx_size={} output=0x{:016x} input=0x{:016x} ep0_ring=0x{:016x} port={} speed={}",
         slot_id,
         context_size,
         output_ctx.phys,
-        input_ctx.phys
+        input_ctx.phys,
+        ep0_ring.phys,
+        root_port,
+        speed_id
     );
 
-    Ok((output_ctx, input_ctx))
+    Ok((output_ctx, input_ctx, ep0_ring))
+}
+
+fn address_device(
+    mmio: &MmioRegion,
+    dboff: u32,
+    rtsoff: u32,
+    command_ring: &DmaPage,
+    event_ring: &DmaPage,
+    input_ctx: &DmaPage,
+    slot_id: u8,
+) -> bool {
+    command_ring.write_u64(0, input_ctx.phys);
+    command_ring.write_u32(8, 0);
+    command_ring.write_u32(
+        12,
+        (XHCI_TRB_TYPE_ADDRESS_DEVICE << 10) | XHCI_TRB_CYCLE | ((slot_id as u32) << 24),
+    );
+    ring_host_doorbell(mmio, dboff, 0, 0);
+    let Some((completion, completed_slot_id)) =
+        wait_command_completion(mmio, rtsoff, event_ring, XHCI_TRB_TYPE_COMMAND_COMPLETION)
+    else {
+        return false;
+    };
+    if completion != XHCI_CC_SUCCESS || completed_slot_id != slot_id {
+        platform::println!(
+            "usb-driver: address device failed completion={} slot_id={}",
+            completion,
+            completed_slot_id
+        );
+        return false;
+    }
+    true
+}
+
+fn reset_port(mmio: &MmioRegion, port_offset: usize, port_index: usize) -> Option<u32> {
+    let initial = mmio.read_u32(port_offset);
+    if (initial & XHCI_PORTSC_CCS) == 0 || (initial & XHCI_PORTSC_OCA) != 0 {
+        return None;
+    }
+    if (initial & XHCI_PORTSC_PED) == 0 {
+        mmio.write_u32(
+            port_offset,
+            (initial & !(XHCI_PORTSC_PR | XHCI_PORTSC_CHANGE_BITS)) | XHCI_PORTSC_PR | XHCI_PORTSC_CHANGE_BITS,
+        );
+        if !wait_until("xhci port reset", 100_000, || {
+            let value = mmio.read_u32(port_offset);
+            (value & XHCI_PORTSC_PR) == 0 && (value & XHCI_PORTSC_PED) != 0
+        }) {
+            platform::println!("usb-driver: port{} reset failed", port_index + 1);
+            return None;
+        }
+    }
+    Some(mmio.read_u32(port_offset))
 }
 
 fn port_in(port: u16, width: u64) -> Result<u64, syscall::SysError> {
@@ -610,25 +751,22 @@ fn enumerate_xhci_controller(loc: PciLocation, bar: XhciBar, vendor: u16, device
         platform::println!("usb-driver: xhci start failed");
         return;
     }
-    if let Some(slot_id) = enable_slot(&mmio, dboff, &command_ring, &event_ring) {
-        platform::println!("usb-driver: enable slot ok slot_id={}", slot_id);
-        let _ = init_slot_contexts(&dcbaa, hccparams1, slot_id);
-    } else {
-        platform::println!("usb-driver: enable slot timed out or failed");
-    }
-
+    let mut selected_port = None;
     for port_index in 0..max_ports as usize {
         let offset = cap_length + XHCI_OP_PORTSC_BASE + port_index * XHCI_OP_PORTSC_STRIDE;
         if offset + 4 > mmio.len {
             break;
         }
-        let portsc = mmio.read_u32(offset);
+        let portsc = reset_port(&mmio, offset, port_index).unwrap_or_else(|| mmio.read_u32(offset));
         let connected = (portsc & 0x1) != 0;
         let enabled = (portsc & 0x2) != 0;
         let over_current = (portsc & 0x8) != 0;
         let reset = (portsc & 0x10) != 0;
         let power = (portsc & 0x200) != 0;
         let speed_id = (portsc >> 10) & 0xf;
+        if connected && enabled && selected_port.is_none() {
+            selected_port = Some((port_index as u8 + 1, speed_id));
+        }
         platform::println!(
             "usb-driver: port{} connected={} enabled={} power={} reset={} over_current={} speed={} status=0x{:08x}",
             port_index + 1,
@@ -640,6 +778,32 @@ fn enumerate_xhci_controller(loc: PciLocation, bar: XhciBar, vendor: u16, device
             xhci_port_speed_name(speed_id),
             portsc
         );
+    }
+
+    if let Some((root_port, speed_id)) = selected_port {
+        if let Some(slot_id) = enable_slot(&mmio, dboff, rtsoff, &command_ring, &event_ring) {
+            platform::println!("usb-driver: enable slot ok slot_id={}", slot_id);
+            match init_slot_contexts(&dcbaa, hccparams1, slot_id, root_port, speed_id) {
+                Ok((_output_ctx, input_ctx, _ep0_ring)) => {
+                    if address_device(&mmio, dboff, rtsoff, &command_ring, &event_ring, &input_ctx, slot_id) {
+                        platform::println!(
+                            "usb-driver: address device ok slot_id={} root_port={}",
+                            slot_id,
+                            root_port
+                        );
+                    } else {
+                        platform::println!("usb-driver: address device timed out or failed");
+                    }
+                }
+                Err(_) => {
+                    platform::println!("usb-driver: slot context initialization failed");
+                }
+            }
+        } else {
+            platform::println!("usb-driver: enable slot timed out or failed");
+        }
+    } else {
+        platform::println!("usb-driver: no enabled usb ports after reset");
     }
 }
 
