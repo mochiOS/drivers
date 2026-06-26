@@ -177,26 +177,6 @@ fn probe_mem_bar(loc: PciLocation, bar_idx: u8) -> Option<XhciBar> {
         0
     };
 
-    if !pci_write_u32(loc, offset, 0xffff_ffff) {
-        return None;
-    }
-    if is_64 && !pci_write_u32(loc, offset + 4, 0xffff_ffff) {
-        let _ = pci_write_u32(loc, offset, original_low);
-        return None;
-    }
-
-    let mask_low = pci_read_u32(loc, offset)?;
-    let mask_high = if is_64 {
-        pci_read_u32(loc, offset + 4)?
-    } else {
-        0
-    };
-
-    let _ = pci_write_u32(loc, offset, original_low);
-    if is_64 {
-        let _ = pci_write_u32(loc, offset + 4, original_high);
-    }
-
     let base = if is_64 {
         ((original_high as u64) << 32) | ((original_low & 0xffff_fff0) as u64)
     } else {
@@ -206,23 +186,9 @@ fn probe_mem_bar(loc: PciLocation, bar_idx: u8) -> Option<XhciBar> {
         return None;
     }
 
-    let mask = if is_64 {
-        ((mask_high as u64) << 32) | ((mask_low & 0xffff_fff0) as u64)
-    } else {
-        (mask_low & 0xffff_fff0) as u64
-    };
-    let size_mask = mask & !0xf;
-    if size_mask == 0 {
-        return None;
-    }
-    let size = (!size_mask).wrapping_add(1);
-    if size == 0 {
-        return None;
-    }
-
     Some(XhciBar {
         phys_base: base,
-        size,
+        size: 0x1_0000,
     })
 }
 
@@ -240,6 +206,18 @@ fn find_xhci_bar(loc: PciLocation) -> Option<XhciBar> {
     None
 }
 
+fn log_pci_bars(loc: PciLocation) {
+    for bar_idx in 0u8..6 {
+        let offset = 0x10 + bar_idx * 4;
+        let value = pci_read_u32(loc, offset).unwrap_or(0);
+        platform::println!(
+            "usb-driver: bar{} raw=0x{:08x}",
+            bar_idx,
+            value
+        );
+    }
+}
+
 fn xhci_port_speed_name(speed_id: u32) -> &'static str {
     match speed_id {
         0 => "unknown",
@@ -254,10 +232,9 @@ fn xhci_port_speed_name(speed_id: u32) -> &'static str {
 
 fn looks_like_xhci(mmio: &MmioRegion) -> bool {
     let cap_length = mmio.read_u8(XHCI_CAP_CAPLENGTH) as usize;
-    let hci_version = mmio.read_u16(XHCI_CAP_HCIVERSION);
     let hcsparams1 = mmio.read_u32(XHCI_CAP_HCSPARAMS1);
     let max_slots = hcsparams1 & 0xff;
-    cap_length >= 0x20 && hci_version >= 0x0100 && max_slots > 0
+    cap_length >= 0x20 && max_slots > 0 && hcsparams1 != 0
 }
 
 fn enumerate_xhci_controller(loc: PciLocation, bar: XhciBar, vendor: u16, device: u16) {
@@ -380,15 +357,60 @@ fn pci_scan() {
                     continue;
                 }
 
+                platform::println!(
+                    "usb-driver: candidate bus={:02x} dev={:02x} func={} vendor=0x{:04x} device=0x{:04x} class=0x{:02x} subclass=0x{:02x} prog_if=0x{:02x}",
+                    bus,
+                    device,
+                    function,
+                    vendor,
+                    device_id,
+                    class,
+                    subclass,
+                    prog_if
+                );
+                log_pci_bars(loc);
+
                 let Some(bar) = find_xhci_bar(loc) else {
+                    platform::println!(
+                        "usb-driver: candidate bus={:02x} dev={:02x} func={} has no MMIO BAR",
+                        bus,
+                        device,
+                        function
+                    );
                     continue;
                 };
 
+                pci_command_enable_memory_and_bus_master(loc);
+                platform::println!(
+                    "usb-driver: candidate bus={:02x} dev={:02x} func={} mmio_base=0x{:016x} mmio_size=0x{:x}",
+                    bus,
+                    device,
+                    function,
+                    bar.phys_base,
+                    bar.size
+                );
                 let Ok(mmio_probe) = MmioRegion::map(bar.phys_base, core::cmp::min(bar.size, 0x1000))
                 else {
+                    platform::println!(
+                        "usb-driver: candidate bus={:02x} dev={:02x} func={} mmio map failed base=0x{:016x} size=0x{:x}",
+                        bus,
+                        device,
+                        function,
+                        bar.phys_base,
+                        bar.size
+                    );
                     continue;
                 };
                 if !looks_like_xhci(&mmio_probe) {
+                    platform::println!(
+                        "usb-driver: candidate bus={:02x} dev={:02x} func={} not xhci caplen=0x{:02x} hci=0x{:04x} hcs1=0x{:08x}",
+                        bus,
+                        device,
+                        function,
+                        mmio_probe.read_u8(XHCI_CAP_CAPLENGTH),
+                        mmio_probe.read_u16(XHCI_CAP_HCIVERSION),
+                        mmio_probe.read_u32(XHCI_CAP_HCSPARAMS1)
+                    );
                     continue;
                 }
 
