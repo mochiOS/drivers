@@ -58,6 +58,7 @@ const XHCI_TRB_TYPE_TRANSFER_EVENT: u32 = 32;
 const XHCI_TRB_TYPE_COMMAND_COMPLETION: u32 = 33;
 const XHCI_TRB_CYCLE: u32 = 1 << 0;
 const XHCI_TRB_TC: u32 = 1 << 1;
+const XHCI_TRB_ISP: u32 = 1 << 2;
 const XHCI_TRB_IOC: u32 = 1 << 5;
 const XHCI_TRB_IDT: u32 = 1 << 6;
 const XHCI_TRB_DIR_IN: u32 = 1 << 16;
@@ -361,6 +362,12 @@ fn current_doorbell_base() -> usize {
 
 fn doorbell_value(target: u32, stream_id: u16) -> u32 {
     target | ((stream_id as u32) << 16)
+}
+
+fn endpoint_dci(address: u8) -> u32 {
+    let endpoint_number = u32::from(address & 0x0f);
+    let direction_in = (address & 0x80) != 0;
+    endpoint_number * 2 + if direction_in { 1 } else { 0 }
 }
 
 fn queue_command_trb(
@@ -803,6 +810,7 @@ fn queue_interrupt_in_transfer(
     ep: InterruptEndpointInfo,
 ) -> Option<DmaPage> {
     let report = DmaPage::allocate(4096).ok()?;
+    let dci = endpoint_dci(ep.address);
     for attempt in 0..16 {
         report.zero();
         clear_event_trbs(event_ring);
@@ -811,10 +819,10 @@ fn queue_interrupt_in_transfer(
             ring_state,
             report.phys,
             ep.max_packet as u32,
-            (XHCI_TRB_TYPE_NORMAL << 10) | XHCI_TRB_IOC,
+            (XHCI_TRB_TYPE_NORMAL << 10) | XHCI_TRB_ISP | XHCI_TRB_IOC,
         );
         let doorbell_base = current_doorbell_base();
-        let dbell_value = doorbell_value(3, 0);
+        let dbell_value = doorbell_value(dci, 0);
         unsafe { write_doorbell(doorbell_base, slot_id as u32, dbell_value) };
         let Some(completion) = wait_transfer_event(mmio, rtsoff, event_ring, slot_id) else {
             continue;
