@@ -1,0 +1,23 @@
+[driver]
+id = "com.mochios.ps2.keyboard"
+name = "PS/2 Keyboard Driver"
+version = "0.1.0"
+description = "User-space PS/2 keyboard polling driver."
+developer = "mochiOS"
+entry = "entry.elf"
+
+[plugkit]
+api = "1"
+driver_class = "input"
+
+[[match]]
+bus = "platform"
+class = "ps2.keyboard"
+
+[capabilities]
+requires = [
+    "ps2.access",
+]
+
+[provides]
+interfaces = ["input.keyboard"]

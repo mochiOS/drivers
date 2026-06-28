@@ -1,0 +1,23 @@
+[driver]
+id = "com.mochios.ps2.mouse"
+name = "PS/2 Mouse Driver"
+version = "0.1.0"
+description = "User-space PS/2 mouse polling driver."
+developer = "mochiOS"
+entry = "entry.elf"
+
+[plugkit]
+api = "1"
+driver_class = "input"
+
+[[match]]
+bus = "platform"
+class = "ps2.mouse"
+
+[capabilities]
+requires = [
+    "ps2.access",
+]
+
+[provides]
+interfaces = ["input.pointer"]
