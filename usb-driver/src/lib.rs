@@ -308,7 +308,7 @@ fn wait_until(label: &str, limit: usize, mut pred: impl FnMut() -> bool) -> bool
         }
         platform::thread::yield_now();
     }
-    platform::println!("usb-driver: timeout waiting for {}", label);
+    let _ = label;
     false
 }
 
@@ -348,64 +348,10 @@ fn xhci_start(mmio: &MmioRegion, cap_length: usize) -> bool {
     })
 }
 
-fn init_command_and_event_rings(
-    mmio: &MmioRegion,
-    cap_length: usize,
-    rtsoff: usize,
-) -> Result<(DmaPage, DmaPage, DmaPage, DmaPage), syscall::SysError> {
-    let dcbaa = DmaPage::allocate(4096)?;
-    let command_ring = DmaPage::allocate(4096)?;
-    let event_ring = DmaPage::allocate(4096)?;
-    let erst = DmaPage::allocate(4096)?;
-
-    dcbaa.zero();
-    command_ring.zero();
-    event_ring.zero();
-    erst.zero();
-
-    let trb_count = command_ring.len / size_of::<Trb>();
-    let link_offset = (trb_count - 1) * size_of::<Trb>();
-    command_ring.write_u64(link_offset, command_ring.phys);
-    command_ring.write_u32(link_offset + 8, 0);
-    command_ring.write_u32(
-        link_offset + 12,
-        (XHCI_TRB_TYPE_LINK << 10) | XHCI_TRB_TC | XHCI_TRB_CYCLE,
-    );
-
-    erst.write_u64(0, event_ring.phys);
-    erst.write_u32(8, (event_ring.len / size_of::<Trb>()) as u32);
-    erst.write_u32(12, 0);
-
-    mmio.write_u64(cap_length + XHCI_OP_DCBAAP, dcbaa.phys);
-    mmio.write_u64(cap_length + XHCI_OP_CRCR, command_ring.phys | 1);
-    mmio.write_u32(cap_length + XHCI_OP_DNCTRL, 0);
-    mmio.write_u32(cap_length + XHCI_OP_CONFIG, 1);
-
-    let ir0 = rtsoff + XHCI_RT_IR0;
-    mmio.write_u32(ir0 + XHCI_IR_IMAN, 0);
-    mmio.write_u32(ir0 + XHCI_IR_IMOD, 0);
-    mmio.write_u32(ir0 + XHCI_IR_ERSTSZ, 1);
-    mmio.write_u64(ir0 + XHCI_IR_ERSTBA, erst.phys);
-    mmio.write_u64(ir0 + XHCI_IR_ERDP, event_ring.phys);
-
-    Ok((dcbaa, command_ring, event_ring, erst))
-}
-
 #[inline(never)]
 unsafe extern "C" fn write_doorbell(base: usize, index: u32, value: u32) {
     // SAFETY: caller provides a mapped xHCI doorbell base and valid doorbell index.
     unsafe { write_volatile((base + (index as usize) * 4) as *mut u32, value) }
-}
-
-fn log_doorbell_write(label: &str, base: usize, index: u32, value: u32) {
-    platform::println!(
-        "usb-driver: {} doorbell base=0x{:016x} index={} address=0x{:016x} value=0x{:08x}",
-        label,
-        base,
-        index,
-        base + (index as usize) * 4,
-        value
-    );
 }
 
 fn current_doorbell_base() -> usize {
@@ -511,7 +457,7 @@ fn wait_transfer_event(
 ) -> Option<u32> {
     let trb_size = size_of::<Trb>();
     let event_count = event_ring.len / trb_size;
-    wait_until("transfer event", 100_000, || {
+    let ready = wait_until("transfer event", 500, || {
         for idx in 0..event_count {
             let control = event_ring.read_u32(idx * trb_size + 12);
             if (control & XHCI_TRB_CYCLE) != 0 {
@@ -520,7 +466,10 @@ fn wait_transfer_event(
         }
         false
     });
-
+    if !ready {
+        let _ = slot_id;
+        return None;
+    }
     let mut completion = None;
     let mut consumed = 0usize;
     for idx in 0..event_count {
@@ -591,8 +540,23 @@ fn init_transfer_ring(ring: &DmaPage) {
     );
 }
 
+fn write_dma_u64(base_virt: u64, offset: usize, value: u64) {
+    // SAFETY: caller provides a writable mapped DMA virtual base and a valid in-page offset.
+    unsafe { write_volatile((base_virt as *mut u8).add(offset) as *mut u64, value) }
+}
+
+fn write_dma_u32(base_virt: u64, offset: usize, value: u32) {
+    // SAFETY: caller provides a writable mapped DMA virtual base and a valid in-page offset.
+    unsafe { write_volatile((base_virt as *mut u8).add(offset) as *mut u32, value) }
+}
+
+fn zero_dma_range(base_virt: u64, len: usize) {
+    // SAFETY: caller provides a writable mapped DMA virtual base for len bytes.
+    unsafe { core::ptr::write_bytes(base_virt as *mut u8, 0, len) }
+}
+
 fn init_slot_contexts(
-    dcbaa: &DmaPage,
+    dcbaa_virt: u64,
     hccparams1: u32,
     slot_id: u8,
     root_port: u8,
@@ -618,7 +582,7 @@ fn init_slot_contexts(
     let slot_ctx = context_size;
     let ep0_ctx = context_size * 2;
 
-    dcbaa.write_u64(slot_id as usize * 8, output_ctx.phys);
+    write_dma_u64(dcbaa_virt, slot_id as usize * 8, output_ctx.phys);
     input_ctx.write_u32(XHCI_INPUT_CONTROL_DROP_FLAGS, 0);
     input_ctx.write_u32(XHCI_INPUT_CONTROL_ADD_FLAGS, 0x3);
     input_ctx.write_u32(XHCI_INPUT_CONTROL_CONFIG_VALUE, 0);
@@ -637,17 +601,6 @@ fn init_slot_contexts(
     );
     input_ctx.write_u64(ep0_ctx + XHCI_EP_CTX_TR_DEQUEUE_LO, ep0_ring.phys | 1);
     input_ctx.write_u32(ep0_ctx + XHCI_EP_CTX_DW4, 8);
-    platform::println!(
-        "usb-driver: slot {} contexts initialized ctx_size={} output=0x{:016x} input=0x{:016x} ep0_ring=0x{:016x} port={} speed={}",
-        slot_id,
-        context_size,
-        output_ctx.phys,
-        input_ctx.phys,
-        ep0_ring.phys,
-        root_port,
-        speed_id
-    );
-
     Ok((
         output_ctx,
         input_ctx,
@@ -678,7 +631,6 @@ fn address_device(
     );
     let doorbell_base = current_doorbell_base();
     let dbell_value = doorbell_value(0, 0);
-    log_doorbell_write("address device", doorbell_base, 0, dbell_value);
     unsafe { write_doorbell(doorbell_base, 0, dbell_value) };
     let Some((completion, completed_slot_id)) =
         wait_command_completion(mmio, rtsoff, event_ring, XHCI_TRB_TYPE_COMMAND_COMPLETION)
@@ -775,13 +727,6 @@ fn configure_interrupt_in_endpoint(
     ep: InterruptEndpointInfo,
 ) -> Option<(DmaPage, TransferRingState)> {
     let ep1_ring = DmaPage::allocate(4096).ok()?;
-    platform::println!(
-        "usb-driver: configure endpoint pages input=0x{:016x}/0x{:016x} ep1=0x{:016x}/0x{:016x}",
-        ctx.input_ctx.virt,
-        ctx.input_ctx.phys,
-        ep1_ring.virt,
-        ep1_ring.phys
-    );
     ep1_ring.zero();
     init_transfer_ring(&ep1_ring);
 
@@ -813,8 +758,10 @@ fn configure_interrupt_in_endpoint(
     );
     ctx.input_ctx
         .write_u64(ep1_in_ctx + XHCI_EP_CTX_TR_DEQUEUE_LO, ep1_ring.phys | 1);
-    ctx.input_ctx
-        .write_u32(ep1_in_ctx + XHCI_EP_CTX_DW4, ep.max_packet as u32);
+    ctx.input_ctx.write_u32(
+        ep1_in_ctx + XHCI_EP_CTX_DW4,
+        (ep.max_packet as u32) | ((ep.max_packet as u32) << 16),
+    );
 
     queue_command_trb(
         ctx.command_ring,
@@ -825,7 +772,6 @@ fn configure_interrupt_in_endpoint(
     );
     let doorbell_base = current_doorbell_base();
     let dbell_value = doorbell_value(0, 0);
-    log_doorbell_write("configure endpoint", doorbell_base, 0, dbell_value);
     unsafe { write_doorbell(doorbell_base, 0, dbell_value) };
     let (completion, completed_slot_id) =
         wait_command_completion(ctx.mmio, ctx.rtsoff, ctx.event_ring, XHCI_TRB_TYPE_COMMAND_COMPLETION)?;
@@ -870,15 +816,12 @@ fn queue_interrupt_in_transfer(
         let doorbell_base = current_doorbell_base();
         let dbell_value = doorbell_value(3, 0);
         unsafe { write_doorbell(doorbell_base, slot_id as u32, dbell_value) };
-        let completion = wait_transfer_event(mmio, rtsoff, event_ring, slot_id)?;
+        let Some(completion) = wait_transfer_event(mmio, rtsoff, event_ring, slot_id) else {
+            continue;
+        };
         if completion == XHCI_CC_SUCCESS {
             return Some(report);
         }
-        platform::println!(
-            "usb-driver: interrupt transfer attempt={} completion={}",
-            attempt + 1,
-            completion
-        );
     }
     None
 }
@@ -1058,10 +1001,6 @@ fn read_report_descriptor(
         return false;
     }
 
-    platform::println!(
-        "usb-driver: report descriptor length={}",
-        transfer_length
-    );
     let preview_len = core::cmp::min(16usize, transfer_length as usize);
     let mut line = [0u8; 3 * 16];
     for i in 0..preview_len {
@@ -1150,13 +1089,6 @@ fn read_configuration_descriptor(
     let mut interface_protocol = 0u8;
     let mut report_descriptor_len = 0u16;
     let mut interrupt_in = None;
-    platform::println!(
-        "usb-driver: config descriptor total_length={} interfaces={} config_value={}",
-        transfer_length,
-        interface_count,
-        config_value
-    );
-
     let bytes = descriptor.ptr();
     let mut offset = 0usize;
     while offset + 2 <= transfer_length as usize {
@@ -1185,15 +1117,6 @@ fn read_configuration_descriptor(
                 interface_class = class;
                 interface_subclass = subclass;
                 interface_protocol = proto;
-                platform::println!(
-                    "usb-driver: interface num={} alt={} eps={} class=0x{:02x} subclass=0x{:02x} proto=0x{:02x}",
-                    iface_num,
-                    alt,
-                    eps,
-                    class,
-                    subclass,
-                    proto
-                );
             }
             USB_DESC_TYPE_ENDPOINT if len >= 7 => {
                 // SAFETY: endpoint descriptor fields are inside validated descriptor bounds.
@@ -1211,23 +1134,12 @@ fn read_configuration_descriptor(
                         interval,
                     });
                 }
-                platform::println!(
-                    "usb-driver: endpoint addr=0x{:02x} attrs=0x{:02x} max_packet={} interval={}",
-                    addr,
-                    attrs,
-                    max_packet,
-                    interval
-                );
             }
             USB_DESC_TYPE_HID if len >= 9 => {
                 // SAFETY: HID descriptor fields are inside validated descriptor bounds.
                 let report_len =
                     unsafe { read_volatile(bytes.add(offset + 7) as *const u16) };
                 report_descriptor_len = report_len;
-                platform::println!(
-                    "usb-driver: hid descriptor report_len={}",
-                    report_len
-                );
             }
             _ => {}
         }
@@ -1407,12 +1319,7 @@ fn find_xhci_bar(loc: PciLocation) -> Option<XhciBar> {
 fn log_pci_bars(loc: PciLocation) {
     for bar_idx in 0u8..6 {
         let offset = 0x10 + bar_idx * 4;
-        let value = pci_read_u32(loc, offset).unwrap_or(0);
-        platform::println!(
-            "usb-driver: bar{} raw=0x{:08x}",
-            bar_idx,
-            value
-        );
+        let _ = pci_read_u32(loc, offset);
     }
 }
 
@@ -1501,31 +1408,70 @@ fn enumerate_xhci_controller(loc: PciLocation, bar: XhciBar, vendor: u16, device
         dboff,
         rtsoff
     );
-    platform::println!(
-        "usb-driver: xhci usbcmd=0x{:08x} usbsts=0x{:08x} pagesize=0x{:08x} config=0x{:08x}",
-        usbcmd,
-        usbsts,
-        pagesize,
-        config
-    );
-
     if !xhci_stop_and_reset(&mmio, cap_length) {
         platform::println!("usb-driver: xhci reset failed");
         return;
     }
-    let Ok((dcbaa, command_ring, event_ring, _erst)) =
-        init_command_and_event_rings(&mmio, cap_length, rtsoff)
-    else {
-        platform::println!("usb-driver: xhci ring initialization failed");
-        return;
+    let dcbaa = match DmaPage::allocate(4096) {
+        Ok(page) => page,
+        Err(_) => {
+            platform::println!("usb-driver: xhci ring initialization failed");
+            return;
+        }
     };
-    let command_ring_state = core::ptr::addr_of_mut!(XHCI_COMMAND_RING_STATE);
-    platform::println!(
-        "usb-driver: command ring=0x{:016x} event ring=0x{:016x} dcbaa=0x{:016x}",
-        command_ring.phys,
-        event_ring.phys,
-        dcbaa.phys
+    let command_ring = match DmaPage::allocate(4096) {
+        Ok(page) => page,
+        Err(_) => {
+            platform::println!("usb-driver: xhci ring initialization failed");
+            return;
+        }
+    };
+    let event_ring = match DmaPage::allocate(4096) {
+        Ok(page) => page,
+        Err(_) => {
+            platform::println!("usb-driver: xhci ring initialization failed");
+            return;
+        }
+    };
+    let erst = match DmaPage::allocate(4096) {
+        Ok(page) => page,
+        Err(_) => {
+            platform::println!("usb-driver: xhci ring initialization failed");
+            return;
+        }
+    };
+
+    dcbaa.zero();
+    command_ring.zero();
+    event_ring.zero();
+    erst.zero();
+
+    let trb_count = command_ring.len / size_of::<Trb>();
+    let link_offset = (trb_count - 1) * size_of::<Trb>();
+    command_ring.write_u64(link_offset, command_ring.phys);
+    command_ring.write_u32(link_offset + 8, 0);
+    command_ring.write_u32(
+        link_offset + 12,
+        (XHCI_TRB_TYPE_LINK << 10) | XHCI_TRB_TC | XHCI_TRB_CYCLE,
     );
+
+    erst.write_u64(0, event_ring.phys);
+    erst.write_u32(8, (event_ring.len / size_of::<Trb>()) as u32);
+    erst.write_u32(12, 0);
+
+    mmio.write_u64(cap_length + XHCI_OP_DCBAAP, dcbaa.phys);
+    mmio.write_u64(cap_length + XHCI_OP_CRCR, command_ring.phys | 1);
+    mmio.write_u32(cap_length + XHCI_OP_DNCTRL, 0);
+    mmio.write_u32(cap_length + XHCI_OP_CONFIG, 1);
+
+    let ir0 = rtsoff + XHCI_RT_IR0;
+    mmio.write_u32(ir0 + XHCI_IR_IMAN, 0);
+    mmio.write_u32(ir0 + XHCI_IR_IMOD, 0);
+    mmio.write_u32(ir0 + XHCI_IR_ERSTSZ, 1);
+    mmio.write_u64(ir0 + XHCI_IR_ERSTBA, erst.phys);
+    mmio.write_u64(ir0 + XHCI_IR_ERDP, event_ring.phys);
+
+    let command_ring_state = core::ptr::addr_of_mut!(XHCI_COMMAND_RING_STATE);
     if !xhci_start(&mmio, cap_length) {
         platform::println!("usb-driver: xhci start failed");
         return;
@@ -1546,17 +1492,6 @@ fn enumerate_xhci_controller(loc: PciLocation, bar: XhciBar, vendor: u16, device
         if connected && enabled && selected_port.is_none() {
             selected_port = Some((port_index as u8 + 1, speed_id));
         }
-        platform::println!(
-            "usb-driver: port{} connected={} enabled={} power={} reset={} over_current={} speed={} status=0x{:08x}",
-            port_index + 1,
-            connected as u8,
-            enabled as u8,
-            power as u8,
-            reset as u8,
-            over_current as u8,
-            xhci_port_speed_name(speed_id),
-            portsc
-        );
     }
 
     if let Some((root_port, speed_id)) = selected_port {
@@ -1568,9 +1503,91 @@ fn enumerate_xhci_controller(loc: PciLocation, bar: XhciBar, vendor: u16, device
             unsafe { &mut *command_ring_state },
             &event_ring,
         ) {
-            platform::println!("usb-driver: enable slot ok slot_id={}", slot_id);
-            match init_slot_contexts(&dcbaa, hccparams1, slot_id, root_port, speed_id) {
-                Ok((_output_ctx, input_ctx, ep0_ring, mut ep0_ring_state)) => {
+            {
+                let output_ctx = match DmaPage::allocate(4096) {
+                    Ok(page) => page,
+                    Err(_) => {
+                        platform::println!("usb-driver: slot context initialization failed");
+                        return;
+                    }
+                };
+                let input_ctx = match DmaPage::allocate(4096) {
+                    Ok(page) => page,
+                    Err(_) => {
+                        platform::println!("usb-driver: slot context initialization failed");
+                        return;
+                    }
+                };
+                let ep0_ring = match DmaPage::allocate(4096) {
+                    Ok(page) => page,
+                    Err(_) => {
+                        platform::println!("usb-driver: slot context initialization failed");
+                        return;
+                    }
+                };
+                let output_ctx_virt = output_ctx.virt;
+                let output_ctx_phys = output_ctx.phys;
+                let output_ctx_len = output_ctx.len;
+                let input_ctx_virt = input_ctx.virt;
+                let input_ctx_phys = input_ctx.phys;
+                let input_ctx_len = input_ctx.len;
+                let ep0_ring_virt = ep0_ring.virt;
+                let ep0_ring_phys = ep0_ring.phys;
+                let ep0_ring_len = ep0_ring.len;
+
+                zero_dma_range(output_ctx_virt, output_ctx_len);
+                zero_dma_range(input_ctx_virt, input_ctx_len);
+                zero_dma_range(ep0_ring_virt, ep0_ring_len);
+                let trb_count = ep0_ring_len / size_of::<Trb>();
+                let link_offset = (trb_count - 1) * size_of::<Trb>();
+                write_dma_u64(ep0_ring_virt, link_offset, ep0_ring_phys);
+                write_dma_u32(ep0_ring_virt, link_offset + 8, 0);
+                write_dma_u32(
+                    ep0_ring_virt,
+                    link_offset + 12,
+                    (XHCI_TRB_TYPE_LINK << 10) | XHCI_TRB_TC | XHCI_TRB_CYCLE,
+                );
+
+                let context_size = if (hccparams1 & XHCI_CTX_SIZE_64) != 0 {
+                    64usize
+                } else {
+                    32usize
+                };
+                let ep0_max_packet_size = match speed_id {
+                    3 => 64u32,
+                    4 | 5 => 512u32,
+                    _ => 8u32,
+                };
+                let slot_ctx = context_size;
+                let ep0_ctx = context_size * 2;
+
+                write_dma_u64(dcbaa.virt, slot_id as usize * 8, output_ctx_phys);
+                write_dma_u32(input_ctx_virt, XHCI_INPUT_CONTROL_DROP_FLAGS, 0);
+                write_dma_u32(input_ctx_virt, XHCI_INPUT_CONTROL_ADD_FLAGS, 0x3);
+                write_dma_u32(input_ctx_virt, XHCI_INPUT_CONTROL_CONFIG_VALUE, 0);
+                write_dma_u32(
+                    input_ctx_virt,
+                    slot_ctx + XHCI_SLOT_CTX_DW0,
+                    ((speed_id & 0xF) << 20) | (1 << 27),
+                );
+                write_dma_u32(
+                    input_ctx_virt,
+                    slot_ctx + XHCI_SLOT_CTX_DW1,
+                    (root_port as u32) << 16,
+                );
+                write_dma_u32(input_ctx_virt, ep0_ctx + XHCI_EP_CTX_DW0, 0);
+                write_dma_u32(
+                    input_ctx_virt,
+                    ep0_ctx + XHCI_EP_CTX_DW1,
+                    (3 << 1) | (XHCI_EP_TYPE_CONTROL_BIDIR << 3) | (ep0_max_packet_size << 16),
+                );
+                write_dma_u64(input_ctx_virt, ep0_ctx + XHCI_EP_CTX_TR_DEQUEUE_LO, ep0_ring_phys | 1);
+                write_dma_u32(input_ctx_virt, ep0_ctx + XHCI_EP_CTX_DW4, 8);
+                let mut ep0_ring_state = TransferRingState {
+                    next_index: 0,
+                    cycle: XHCI_TRB_CYCLE,
+                };
+
                     if address_device(
                         &mmio,
                         dboff,
@@ -1581,11 +1598,6 @@ fn enumerate_xhci_controller(loc: PciLocation, bar: XhciBar, vendor: u16, device
                         &input_ctx,
                         slot_id,
                     ) {
-                        platform::println!(
-                            "usb-driver: address device ok slot_id={} root_port={}",
-                            slot_id,
-                            root_port
-                        );
                         if let Some((vendor_id, product_id)) = read_device_descriptor(
                             &mmio,
                             dboff,
@@ -1619,20 +1631,7 @@ fn enumerate_xhci_controller(loc: PciLocation, bar: XhciBar, vendor: u16, device
                                     &mut ep0_ring_state,
                                     config.config_value,
                                 ) {
-                                    platform::println!(
-                                        "usb-driver: set configuration ok value={} class=0x{:02x} subclass=0x{:02x} proto=0x{:02x}",
-                                        config.config_value,
-                                        config.interface_class,
-                                        config.interface_subclass,
-                                        config.interface_protocol
-                                    );
                                     if let Some(ep) = config.interrupt_in {
-                                        platform::println!(
-                                            "usb-driver: interrupt endpoint selected addr=0x{:02x} max_packet={} interval={}",
-                                            ep.address,
-                                            ep.max_packet,
-                                            ep.interval
-                                        );
                                         let idle_ok = hid_set_idle(
                                             &mmio,
                                             rtsoff,
@@ -1641,11 +1640,6 @@ fn enumerate_xhci_controller(loc: PciLocation, bar: XhciBar, vendor: u16, device
                                             &ep0_ring,
                                             &mut ep0_ring_state,
                                             config.interface_number,
-                                        );
-                                        platform::println!(
-                                            "usb-driver: hid set idle {} interface={}",
-                                            if idle_ok { "ok" } else { "failed" },
-                                            config.interface_number
                                         );
                                         let protocol_ok = hid_set_protocol(
                                             &mmio,
@@ -1657,10 +1651,6 @@ fn enumerate_xhci_controller(loc: PciLocation, bar: XhciBar, vendor: u16, device
                                             config.interface_number,
                                             1,
                                         );
-                                        platform::println!(
-                                            "usb-driver: hid set protocol {} value=1",
-                                            if protocol_ok { "ok" } else { "failed" }
-                                        );
                                         if let Some((ep1_ring, mut ep1_ring_state)) =
                                             configure_interrupt_in_endpoint(
                                                 &mut ConfigureEndpointCtx {
@@ -1669,7 +1659,7 @@ fn enumerate_xhci_controller(loc: PciLocation, bar: XhciBar, vendor: u16, device
                                                     command_ring: &command_ring,
                                                     ring_state: unsafe { &mut *command_ring_state },
                                                     event_ring: &event_ring,
-                                                    output_ctx: &_output_ctx,
+                                                    output_ctx: &output_ctx,
                                                     input_ctx: &input_ctx,
                                                     slot_id,
                                                     hccparams1,
@@ -1679,24 +1669,19 @@ fn enumerate_xhci_controller(loc: PciLocation, bar: XhciBar, vendor: u16, device
                                                 ep,
                                             )
                                         {
-                                            platform::println!(
-                                                "usb-driver: configure endpoint ok dci=3 ring=0x{:016x}",
-                                                ep1_ring.phys
-                                            );
+                                            loop {
                                                 if let Some(report) = queue_interrupt_in_transfer(
                                                     &mmio,
                                                     rtsoff,
                                                     &event_ring,
                                                     slot_id,
-                                                &ep1_ring,
-                                                &mut ep1_ring_state,
-                                                ep,
-                                            ) {
-                                                log_hid_input_report(&report, ep);
-                                            } else {
-                                                platform::println!(
-                                                    "usb-driver: hid interrupt report not received"
-                                                );
+                                                    &ep1_ring,
+                                                    &mut ep1_ring_state,
+                                                    ep,
+                                                ) {
+                                                    log_hid_input_report(&report, ep);
+                                                }
+                                                platform::thread::yield_now();
                                             }
                                         } else {
                                             platform::println!(
@@ -1733,10 +1718,6 @@ fn enumerate_xhci_controller(loc: PciLocation, bar: XhciBar, vendor: u16, device
                     } else {
                         platform::println!("usb-driver: address device timed out or failed");
                     }
-                }
-                Err(_) => {
-                    platform::println!("usb-driver: slot context initialization failed");
-                }
             }
         } else {
             platform::println!("usb-driver: enable slot timed out or failed");
@@ -1770,60 +1751,18 @@ fn pci_scan() {
                     continue;
                 }
 
-                platform::println!(
-                    "usb-driver: candidate bus={:02x} dev={:02x} func={} vendor=0x{:04x} device=0x{:04x} class=0x{:02x} subclass=0x{:02x} prog_if=0x{:02x}",
-                    bus,
-                    device,
-                    function,
-                    vendor,
-                    device_id,
-                    class,
-                    subclass,
-                    prog_if
-                );
                 log_pci_bars(loc);
 
                 let Some(bar) = find_xhci_bar(loc) else {
-                    platform::println!(
-                        "usb-driver: candidate bus={:02x} dev={:02x} func={} has no MMIO BAR",
-                        bus,
-                        device,
-                        function
-                    );
                     continue;
                 };
 
                 pci_command_enable_memory_and_bus_master(loc);
-                platform::println!(
-                    "usb-driver: candidate bus={:02x} dev={:02x} func={} mmio_base=0x{:016x} mmio_size=0x{:x}",
-                    bus,
-                    device,
-                    function,
-                    bar.phys_base,
-                    bar.size
-                );
                 let Ok(mmio_probe) = MmioRegion::map(bar.phys_base, core::cmp::min(bar.size, 0x1000))
                 else {
-                    platform::println!(
-                        "usb-driver: candidate bus={:02x} dev={:02x} func={} mmio map failed base=0x{:016x} size=0x{:x}",
-                        bus,
-                        device,
-                        function,
-                        bar.phys_base,
-                        bar.size
-                    );
                     continue;
                 };
                 if !looks_like_xhci(&mmio_probe) {
-                    platform::println!(
-                        "usb-driver: candidate bus={:02x} dev={:02x} func={} not xhci caplen=0x{:02x} hci=0x{:04x} hcs1=0x{:08x}",
-                        bus,
-                        device,
-                        function,
-                        mmio_probe.read_u8(XHCI_CAP_CAPLENGTH),
-                        mmio_probe.read_u16(XHCI_CAP_HCIVERSION),
-                        mmio_probe.read_u32(XHCI_CAP_HCSPARAMS1)
-                    );
                     continue;
                 }
 
