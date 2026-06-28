@@ -233,6 +233,7 @@ static mut XHCI_COMMAND_RING_STATE: CommandRingState = CommandRingState {
     cycle: XHCI_TRB_CYCLE,
 };
 static mut XHCI_DOORBELL_BASE: usize = 0;
+static mut PCI_CONFIG_IO_FAILED_LOGGED: bool = false;
 
 impl DmaPage {
     fn allocate(len: usize) -> Result<Self, syscall::SysError> {
@@ -1233,8 +1234,29 @@ fn pci_config_address(loc: PciLocation, offset: u8) -> u32 {
 
 fn pci_read_u32(loc: PciLocation, offset: u8) -> Option<u32> {
     let addr = pci_config_address(loc, offset);
-    port_out(PCI_CFG_ADDR, addr as u64, 4).ok()?;
-    let value = port_in(PCI_CFG_DATA, 4).ok()?;
+    if port_out(PCI_CFG_ADDR, addr as u64, 4).is_err() {
+        // SAFETY: best-effort single log for diagnosis in single-threaded startup path.
+        unsafe {
+            if !PCI_CONFIG_IO_FAILED_LOGGED {
+                PCI_CONFIG_IO_FAILED_LOGGED = true;
+                platform::println!("usb-driver: pci config io denied");
+            }
+        }
+        return None;
+    }
+    let value = match port_in(PCI_CFG_DATA, 4) {
+        Ok(v) => v,
+        Err(_) => {
+            // SAFETY: best-effort single log for diagnosis in single-threaded startup path.
+            unsafe {
+                if !PCI_CONFIG_IO_FAILED_LOGGED {
+                    PCI_CONFIG_IO_FAILED_LOGGED = true;
+                    platform::println!("usb-driver: pci config io denied");
+                }
+            }
+            return None;
+        }
+    };
     Some(value as u32)
 }
 
@@ -1764,15 +1786,6 @@ fn pci_scan() {
                 let Some(bar) = find_xhci_bar(loc) else {
                     continue;
                 };
-
-                pci_command_enable_memory_and_bus_master(loc);
-                let Ok(mmio_probe) = MmioRegion::map(bar.phys_base, core::cmp::min(bar.size, 0x1000))
-                else {
-                    continue;
-                };
-                if !looks_like_xhci(&mmio_probe) {
-                    continue;
-                }
 
                 let mut spec = DeviceSpec::new(
                     format!("/pci/{:02x}:{:02x}.{}", bus, device, function),
