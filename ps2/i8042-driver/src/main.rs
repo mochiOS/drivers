@@ -8,6 +8,7 @@ global_asm!(
     .global _start
 _start:
     xor rbp, rbp
+    mov rdi, rsp
     and rsp, -16
     call i8042_driver_main
 1:
@@ -17,6 +18,6 @@ _start:
 );
 
 #[unsafe(no_mangle)]
-pub extern "C" fn i8042_driver_main() -> ! {
-    i8042_driver::run()
+pub extern "C" fn i8042_driver_main(sp: *const usize) -> ! {
+    i8042_driver::run(sp)
 }

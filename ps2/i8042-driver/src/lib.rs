@@ -96,9 +96,51 @@ fn init_i8042() {
     let _ = send_mouse_command(0xF4);
 }
 
-pub fn run() -> ! {
+fn parse_decimal_u64(bytes: &[u8]) -> Option<u64> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut out = 0u64;
+    for &b in bytes {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        out = out.checked_mul(10)?;
+        out = out.checked_add(u64::from(b - b'0'))?;
+    }
+    Some(out)
+}
+
+unsafe fn c_string_len(ptr: *const u8) -> usize {
+    let mut len = 0usize;
+    loop {
+        let ch = unsafe { core::ptr::read_volatile(ptr.add(len)) };
+        if ch == 0 {
+            return len;
+        }
+        len += 1;
+    }
+}
+
+unsafe fn parse_endpoint_arg(sp: *const usize) -> Option<u64> {
+    let stack = unsafe { platform::runtime::InitialStack::parse(sp) };
+    for &arg_ptr in stack.argv {
+        if arg_ptr.is_null() {
+            continue;
+        }
+        let len = unsafe { c_string_len(arg_ptr) };
+        let arg = unsafe { core::slice::from_raw_parts(arg_ptr, len) };
+        if let Some(value) = parse_decimal_u64(arg) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+pub fn run(sp: *const usize) -> ! {
     platform::println!("i8042: start");
     init_i8042();
+    let input_endpoint = unsafe { parse_endpoint_arg(sp) }.unwrap_or(0);
 
     let mut mouse_buttons = 0u8;
     let mut mouse_packet = [0u8; 3];
@@ -121,7 +163,9 @@ pub fn run() -> ! {
         };
 
         if (status & STATUS_AUX_DATA) == 0 {
-            platform::println!("i8042: key scancode=0x{:02x}", byte);
+            if input_endpoint != 0 {
+                let _ = platform::ipc::send(input_endpoint, &[byte]);
+            }
             continue;
         }
 
