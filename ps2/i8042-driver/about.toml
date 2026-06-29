@@ -17,7 +17,7 @@ class = "i8042"
 [capabilities]
 requires = [
     "device.input",
-    "ipc.server",
+    "ipc.client",
 ]
 
 [provides]
