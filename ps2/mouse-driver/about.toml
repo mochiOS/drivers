@@ -16,7 +16,7 @@ class = "ps2.mouse"
 
 [capabilities]
 requires = [
-    "ps2.access",
+    "device.input",
 ]
 
 [provides]

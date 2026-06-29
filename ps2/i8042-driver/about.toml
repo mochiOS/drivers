@@ -1,0 +1,23 @@
+[driver]
+id = "com.mochios.ps2.i8042"
+name = "i8042 Controller Driver"
+version = "0.1.0"
+description = "User-space i8042 controller driver for PS/2 keyboard and mouse."
+developer = "mochiOS"
+entry = "entry.elf"
+
+[plugkit]
+api = "1"
+driver_class = "input"
+
+[[match]]
+bus = "platform"
+class = "i8042"
+
+[capabilities]
+requires = [
+    "device.input",
+]
+
+[provides]
+interfaces = ["input.keyboard", "input.pointer"]
