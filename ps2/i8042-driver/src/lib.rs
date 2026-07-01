@@ -6,14 +6,6 @@ const STATUS_OUTPUT_FULL: u8 = 1 << 0;
 const STATUS_INPUT_FULL: u8 = 1 << 1;
 const STATUS_AUX_DATA: u8 = 1 << 5;
 
-fn sign_extend(delta: u8, sign: bool) -> i16 {
-    if sign {
-        (delta as i16) - 256
-    } else {
-        delta as i16
-    }
-}
-
 fn wait_input_clear(mut budget: usize) -> bool {
     while budget > 0 {
         match platform::port::in_u8(0x64) {
@@ -74,6 +66,10 @@ fn send_mouse_command(cmd: u8) -> bool {
         && matches!(read_data_with_timeout(100_000), Some(0xFA))
 }
 
+fn send_keyboard_command(cmd: u8) -> bool {
+    write_data(cmd) && matches!(read_data_with_timeout(100_000), Some(0xFA))
+}
+
 fn init_i8042() {
     flush_output_buffer();
 
@@ -86,12 +82,15 @@ fn init_i8042() {
 
     if write_command(0x20) {
         if let Some(config) = read_data_with_timeout(100_000) {
-            let updated = (config | 0x03) & !0x30;
+            // Enable IRQ1/IRQ12 and keyboard translation so the first port
+            // produces set-1 scancodes expected by input.service.
+            let updated = (config | 0x43) & !0x30;
             let _ = write_command(0x60);
             let _ = write_data(updated);
         }
     }
 
+    let _ = send_keyboard_command(0xF4);
     let _ = send_mouse_command(0xF6);
     let _ = send_mouse_command(0xF4);
 }
@@ -141,10 +140,7 @@ pub fn run(sp: *const usize) -> ! {
     platform::println!("i8042: start");
     init_i8042();
     let input_endpoint = unsafe { parse_endpoint_arg(sp) }.unwrap_or(0);
-
-    let mut mouse_buttons = 0u8;
-    let mut mouse_packet = [0u8; 3];
-    let mut mouse_packet_len = 0usize;
+    let mut keyboard_log_budget = 8usize;
 
     loop {
         let Ok(status) = platform::port::in_u8(0x64) else {
@@ -163,42 +159,15 @@ pub fn run(sp: *const usize) -> ! {
         };
 
         if (status & STATUS_AUX_DATA) == 0 {
+            if keyboard_log_budget > 0 {
+                platform::println!("i8042: key byte=0x{:02x}", byte);
+                keyboard_log_budget -= 1;
+            }
             if input_endpoint != 0 {
-                let _ = platform::ipc::send(input_endpoint, &[byte]);
+                let packet = [platform::input::RAW_KIND_KEYBOARD, 0, 0, 0, byte, 0, 0, 0];
+                let _ = platform::ipc::send(input_endpoint, &packet);
             }
             continue;
-        }
-
-        if mouse_packet_len == 0 && (byte & 0x08) == 0 {
-            continue;
-        }
-        mouse_packet[mouse_packet_len] = byte;
-        mouse_packet_len += 1;
-        if mouse_packet_len < 3 {
-            continue;
-        }
-        mouse_packet_len = 0;
-
-        let b0 = mouse_packet[0];
-        let b1 = mouse_packet[1];
-        let b2 = mouse_packet[2];
-        if (b0 & 0xC0) != 0 {
-            continue;
-        }
-
-        let buttons = b0 & 0x07;
-        let x = sign_extend(b1, (b0 & 0x10) != 0);
-        let dy = -sign_extend(b2, (b0 & 0x20) != 0);
-        if x != 0 || dy != 0 {
-            platform::println!("i8042: mouse moved dx={} dy={}", x, dy);
-        }
-        if buttons != mouse_buttons {
-            platform::println!(
-                "i8042: mouse buttons 0x{:02x} -> 0x{:02x}",
-                mouse_buttons,
-                buttons
-            );
-            mouse_buttons = buttons;
         }
     }
 }
