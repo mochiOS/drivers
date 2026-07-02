@@ -1,0 +1,17 @@
+[package]
+id = "org.mochios.ps2.i8042"
+name = "i8042 Controller Driver"
+version = "0.1.0"
+vendor = "mochiOS"
+
+[[binary]]
+path = "/bin/drivers/ps2/i8042.driver/entry.elf"
+kind = "driver"
+driver_class = "input"
+api_version = 1
+match_bus = "platform"
+match_class = "i8042"
+requires = [
+    "device.input",
+    "ipc.client",
+]

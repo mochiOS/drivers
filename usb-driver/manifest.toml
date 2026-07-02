@@ -1,0 +1,18 @@
+[package]
+id = "org.mochios.usb.qemu"
+name = "QEMU xHCI Controller Driver"
+version = "0.1.0"
+vendor = "mochiOS"
+
+[[binary]]
+path = "/bin/drivers/usb/qemu-usb.driver/entry.elf"
+kind = "driver"
+driver_class = "usb"
+api_version = 1
+match_bus = "pci"
+match_class = "usb"
+requires = [
+    "dma.allocate",
+    "usb.access",
+    "memory.phys.map",
+]
