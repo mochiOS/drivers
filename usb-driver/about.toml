@@ -1,5 +1,5 @@
 [driver]
-id = "com.mochios.usb.qemu"
+id = "org.mochios.usb.qemu"
 name = "QEMU xHCI Controller Driver"
 version = "0.1.0"
 description = "User-space xHCI controller enumerator for QEMU."

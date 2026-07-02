@@ -1,5 +1,5 @@
 [driver]
-id = "com.mochios.ps2.keyboard"
+id = "org.mochios.ps2.keyboard"
 name = "PS/2 Keyboard Driver"
 version = "0.1.0"
 description = "User-space PS/2 keyboard polling driver."

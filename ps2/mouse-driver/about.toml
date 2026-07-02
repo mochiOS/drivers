@@ -1,5 +1,5 @@
 [driver]
-id = "com.mochios.ps2.mouse"
+id = "org.mochios.ps2.mouse"
 name = "PS/2 Mouse Driver"
 version = "0.1.0"
 description = "User-space PS/2 mouse polling driver."

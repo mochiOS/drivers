@@ -1,5 +1,5 @@
 [driver]
-id = "com.mochios.ps2.i8042"
+id = "org.mochios.ps2.i8042"
 name = "i8042 Controller Driver"
 version = "0.1.0"
 description = "User-space i8042 controller driver for PS/2 keyboard and mouse."
