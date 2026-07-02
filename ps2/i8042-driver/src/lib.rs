@@ -137,6 +137,9 @@ unsafe fn parse_endpoint_arg(sp: *const usize) -> Option<u64> {
 }
 
 pub fn run(sp: *const usize) -> ! {
+    unsafe {
+        let _ = platform::logger::init_from_initial_stack(sp);
+    }
     platform::println!("i8042: start");
     init_i8042();
     let input_endpoint = unsafe { parse_endpoint_arg(sp) }.unwrap_or(0);
