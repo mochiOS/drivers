@@ -5,6 +5,7 @@ use mochi_user_platform as platform;
 const STATUS_OUTPUT_FULL: u8 = 1 << 0;
 const STATUS_INPUT_FULL: u8 = 1 << 1;
 const STATUS_AUX_DATA: u8 = 1 << 5;
+const INPUT_SERVICE_NAME: &str = "input.service";
 
 fn wait_input_clear(mut budget: usize) -> bool {
     while budget > 0 {
@@ -95,6 +96,12 @@ fn init_i8042() {
     let _ = send_mouse_command(0xF4);
 }
 
+fn input_service_tid() -> u64 {
+    platform::process::find_by_name(INPUT_SERVICE_NAME)
+        .ok()
+        .unwrap_or(0)
+}
+
 fn parse_decimal_u64(bytes: &[u8]) -> Option<u64> {
     if bytes.is_empty() {
         return None;
@@ -142,10 +149,17 @@ pub fn run(sp: *const usize) -> ! {
     }
     platform::println!("i8042: start");
     init_i8042();
-    let input_endpoint = unsafe { parse_endpoint_arg(sp) }.unwrap_or(0);
+    let mut input_tid = input_service_tid();
     let mut keyboard_log_budget = 8usize;
+    let mut reply = [0u8; 8];
 
     loop {
+        if input_tid == 0 {
+            input_tid = input_service_tid();
+            platform::thread::yield_now();
+            continue;
+        }
+
         let Ok(status) = platform::port::in_u8(0x64) else {
             platform::thread::yield_now();
             continue;
@@ -166,9 +180,9 @@ pub fn run(sp: *const usize) -> ! {
                 platform::println!("i8042: key byte=0x{:02x}", byte);
                 keyboard_log_budget -= 1;
             }
-            if input_endpoint != 0 {
-                let packet = [platform::input::RAW_KIND_KEYBOARD, 0, 0, 0, byte, 0, 0, 0];
-                let _ = platform::ipc::send(input_endpoint, &packet);
+            let packet = [platform::input::RAW_KIND_KEYBOARD, 0, 0, 0, byte, 0, 0, 0];
+            if platform::ipc::call(input_tid, &packet, &mut reply).is_err() {
+                input_tid = 0;
             }
             continue;
         }
