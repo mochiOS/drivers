@@ -43,17 +43,9 @@ pub fn run() -> ! {
                 }
 
                 let buttons = b0 & 0x07;
-                let x = sign_extend(b1, (b0 & 0x10) != 0);
-                let dy = -sign_extend(b2, (b0 & 0x20) != 0);
-                if x != 0 || dy != 0 {
-                    platform::println!("ps2-mouse: moved dx={} dy={}", x, dy);
-                }
+                let _x = sign_extend(b1, (b0 & 0x10) != 0);
+                let _dy = -sign_extend(b2, (b0 & 0x20) != 0);
                 if buttons != last_buttons {
-                    platform::println!(
-                        "ps2-mouse: buttons 0x{:02x} -> 0x{:02x}",
-                        last_buttons,
-                        buttons
-                    );
                     last_buttons = buttons;
                 }
             }

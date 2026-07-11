@@ -62,9 +62,7 @@ fn flush_output_buffer() {
 }
 
 fn send_mouse_command(cmd: u8) -> bool {
-    write_command(0xD4)
-        && write_data(cmd)
-        && matches!(read_data_with_timeout(100_000), Some(0xFA))
+    write_command(0xD4) && write_data(cmd) && matches!(read_data_with_timeout(100_000), Some(0xFA))
 }
 
 fn send_keyboard_command(cmd: u8) -> bool {
@@ -102,47 +100,6 @@ fn input_service_tid() -> u64 {
         .unwrap_or(0)
 }
 
-fn parse_decimal_u64(bytes: &[u8]) -> Option<u64> {
-    if bytes.is_empty() {
-        return None;
-    }
-    let mut out = 0u64;
-    for &b in bytes {
-        if !b.is_ascii_digit() {
-            return None;
-        }
-        out = out.checked_mul(10)?;
-        out = out.checked_add(u64::from(b - b'0'))?;
-    }
-    Some(out)
-}
-
-unsafe fn c_string_len(ptr: *const u8) -> usize {
-    let mut len = 0usize;
-    loop {
-        let ch = unsafe { core::ptr::read_volatile(ptr.add(len)) };
-        if ch == 0 {
-            return len;
-        }
-        len += 1;
-    }
-}
-
-unsafe fn parse_endpoint_arg(sp: *const usize) -> Option<u64> {
-    let stack = unsafe { platform::runtime::InitialStack::parse(sp) };
-    for &arg_ptr in stack.argv {
-        if arg_ptr.is_null() {
-            continue;
-        }
-        let len = unsafe { c_string_len(arg_ptr) };
-        let arg = unsafe { core::slice::from_raw_parts(arg_ptr, len) };
-        if let Some(value) = parse_decimal_u64(arg) {
-            return Some(value);
-        }
-    }
-    None
-}
-
 pub fn run(sp: *const usize) -> ! {
     unsafe {
         let _ = platform::logger::init_from_initial_stack(sp);
@@ -150,7 +107,8 @@ pub fn run(sp: *const usize) -> ! {
     platform::println!("i8042: start");
     init_i8042();
     let mut input_tid = input_service_tid();
-    let mut keyboard_log_budget = 8usize;
+    let mut mouse_packet = [0u8; 3];
+    let mut mouse_packet_len = 0usize;
     let mut reply = [0u8; 8];
 
     loop {
@@ -176,15 +134,35 @@ pub fn run(sp: *const usize) -> ! {
         };
 
         if (status & STATUS_AUX_DATA) == 0 {
-            if keyboard_log_budget > 0 {
-                platform::println!("i8042: key byte=0x{:02x}", byte);
-                keyboard_log_budget -= 1;
-            }
             let packet = [platform::input::RAW_KIND_KEYBOARD, 0, 0, 0, byte, 0, 0, 0];
             if platform::ipc::call(input_tid, &packet, &mut reply).is_err() {
                 input_tid = 0;
             }
             continue;
+        }
+
+        if mouse_packet_len == 0 && (byte & 0x08) == 0 {
+            continue;
+        }
+        mouse_packet[mouse_packet_len] = byte;
+        mouse_packet_len += 1;
+        if mouse_packet_len < 3 {
+            continue;
+        }
+        mouse_packet_len = 0;
+
+        let packet = [
+            platform::input::RAW_KIND_MOUSE_PACKET,
+            0,
+            0,
+            0,
+            mouse_packet[0],
+            mouse_packet[1],
+            mouse_packet[2],
+            0,
+        ];
+        if platform::ipc::call(input_tid, &packet, &mut reply).is_err() {
+            input_tid = 0;
         }
     }
 }
