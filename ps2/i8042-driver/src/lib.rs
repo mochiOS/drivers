@@ -109,7 +109,7 @@ pub fn run(sp: *const usize) -> ! {
     let mut input_tid = input_service_tid();
     let mut mouse_packet = [0u8; 3];
     let mut mouse_packet_len = 0usize;
-    let mut reply = [0u8; 8];
+    let mut reply = [];
 
     loop {
         if input_tid == 0 {
