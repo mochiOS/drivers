@@ -12,6 +12,7 @@ use plugkit::prelude::*;
 const PCI_CFG_ADDR: u16 = 0xCF8;
 const PCI_CFG_DATA: u16 = 0xCFC;
 const XHCI_PROG_IF: u8 = 0x30;
+const INPUT_SERVICE_NAME: &str = "input.service";
 
 const PROT_READ: u64 = 0x1;
 const PROT_WRITE: u64 = 0x2;
@@ -449,7 +450,11 @@ fn wait_command_completion(
     }
 
     if consumed != 0 {
-        let next_offset = if consumed >= event_count { 0 } else { consumed * trb_size };
+        let next_offset = if consumed >= event_count {
+            0
+        } else {
+            consumed * trb_size
+        };
         let ir0 = rtsoff + XHCI_RT_IR0;
         mmio.write_u64(ir0 + XHCI_IR_ERDP, event_ring.phys + next_offset as u64);
     }
@@ -497,7 +502,11 @@ fn wait_transfer_event(
     }
 
     if consumed != 0 {
-        let next_offset = if consumed >= event_count { 0 } else { consumed * trb_size };
+        let next_offset = if consumed >= event_count {
+            0
+        } else {
+            consumed * trb_size
+        };
         let ir0 = rtsoff + XHCI_RT_IR0;
         mmio.write_u64(ir0 + XHCI_IR_ERDP, event_ring.phys + next_offset as u64);
     }
@@ -598,10 +607,7 @@ fn init_slot_contexts(
         slot_ctx + XHCI_SLOT_CTX_DW0,
         ((speed_id & 0xF) << 20) | (1 << 27),
     );
-    input_ctx.write_u32(
-        slot_ctx + XHCI_SLOT_CTX_DW1,
-        (root_port as u32) << 16,
-    );
+    input_ctx.write_u32(slot_ctx + XHCI_SLOT_CTX_DW1, (root_port as u32) << 16);
     input_ctx.write_u32(ep0_ctx + XHCI_EP_CTX_DW0, 0);
     input_ctx.write_u32(
         ep0_ctx + XHCI_EP_CTX_DW1,
@@ -656,13 +662,7 @@ fn address_device(
     true
 }
 
-fn build_setup_packet(
-    request_type: u8,
-    request: u8,
-    value: u16,
-    index: u16,
-    length: u16,
-) -> u64 {
+fn build_setup_packet(request_type: u8, request: u8, value: u16, index: u16, length: u16) -> u64 {
     u64::from(request_type)
         | (u64::from(request) << 8)
         | (u64::from(value) << 16)
@@ -755,11 +755,10 @@ fn configure_interrupt_in_endpoint(
         slot_ctx + XHCI_SLOT_CTX_DW0,
         ((ctx.speed_id & 0xF) << 20) | (3 << 27),
     );
-    ctx.input_ctx.write_u32(
-        slot_ctx + XHCI_SLOT_CTX_DW1,
-        (ctx.root_port as u32) << 16,
-    );
-    ctx.input_ctx.write_u32(ep1_in_ctx + XHCI_EP_CTX_DW0, interval << 16);
+    ctx.input_ctx
+        .write_u32(slot_ctx + XHCI_SLOT_CTX_DW1, (ctx.root_port as u32) << 16);
+    ctx.input_ctx
+        .write_u32(ep1_in_ctx + XHCI_EP_CTX_DW0, interval << 16);
     ctx.input_ctx.write_u32(
         ep1_in_ctx + XHCI_EP_CTX_DW1,
         (3 << 1) | (XHCI_EP_TYPE_INTERRUPT_IN << 3) | ((ep.max_packet as u32) << 16),
@@ -781,8 +780,12 @@ fn configure_interrupt_in_endpoint(
     let doorbell_base = current_doorbell_base();
     let dbell_value = doorbell_value(0, 0);
     unsafe { write_doorbell(doorbell_base, 0, dbell_value) };
-    let (completion, completed_slot_id) =
-        wait_command_completion(ctx.mmio, ctx.rtsoff, ctx.event_ring, XHCI_TRB_TYPE_COMMAND_COMPLETION)?;
+    let (completion, completed_slot_id) = wait_command_completion(
+        ctx.mmio,
+        ctx.rtsoff,
+        ctx.event_ring,
+        XHCI_TRB_TYPE_COMMAND_COMPLETION,
+    )?;
     if completion != XHCI_CC_SUCCESS || completed_slot_id != ctx.slot_id {
         platform::println!(
             "usb-driver: configure endpoint failed completion={} slot_id={}",
@@ -929,6 +932,38 @@ fn log_hid_input_report(report: &DmaPage, ep: InterruptEndpointInfo) {
     }
 }
 
+fn input_service_tid() -> u64 {
+    platform::process::find_by_name(INPUT_SERVICE_NAME)
+        .ok()
+        .unwrap_or(0)
+}
+
+fn send_hid_input_report(input_tid: &mut u64, report: &DmaPage, ep: InterruptEndpointInfo) {
+    let packet_len = core::cmp::min(ep.max_packet as usize, report.len);
+    if packet_len < 5 {
+        return;
+    }
+    if *input_tid == 0 {
+        *input_tid = input_service_tid();
+        if *input_tid == 0 {
+            return;
+        }
+    }
+
+    let buttons = report.read_u8(0) & 0x07;
+    let x = u16::from_le_bytes([report.read_u8(1), report.read_u8(2)]);
+    let y = u16::from_le_bytes([report.read_u8(3), report.read_u8(4)]);
+    let mut packet = [0u8; 12];
+    packet[0] = platform::input::RAW_KIND_POINTER_ABSOLUTE;
+    packet[4] = buttons;
+    packet[6..8].copy_from_slice(&x.to_le_bytes());
+    packet[8..10].copy_from_slice(&y.to_le_bytes());
+    let mut reply = [];
+    if platform::ipc::call(*input_tid, &packet, &mut reply).is_err() {
+        *input_tid = 0;
+    }
+}
+
 fn read_device_descriptor(
     mmio: &MmioRegion,
     dboff: usize,
@@ -978,7 +1013,13 @@ fn read_report_descriptor(
     queue_transfer_trb(
         ep0_ring,
         ring_state,
-        build_setup_packet(0x81, 0x06, USB_DESC_TYPE_REPORT << 8, interface_number as u16, transfer_length),
+        build_setup_packet(
+            0x81,
+            0x06,
+            USB_DESC_TYPE_REPORT << 8,
+            interface_number as u16,
+            transfer_length,
+        ),
         8,
         (XHCI_TRB_TYPE_SETUP_STAGE << 10) | XHCI_TRB_IDT | (3 << 16),
     );
@@ -1146,8 +1187,7 @@ fn read_configuration_descriptor(
             }
             USB_DESC_TYPE_HID if len >= 9 => {
                 // SAFETY: HID descriptor fields are inside validated descriptor bounds.
-                let report_len =
-                    unsafe { read_volatile(bytes.add(offset + 7) as *const u16) };
+                let report_len = unsafe { read_volatile(bytes.add(offset + 7) as *const u16) };
                 report_descriptor_len = report_len;
             }
             _ => {}
@@ -1203,7 +1243,9 @@ fn reset_port(mmio: &MmioRegion, port_offset: usize, port_index: usize) -> Optio
     if (initial & XHCI_PORTSC_PED) == 0 {
         mmio.write_u32(
             port_offset,
-            (initial & !(XHCI_PORTSC_PR | XHCI_PORTSC_CHANGE_BITS)) | XHCI_PORTSC_PR | XHCI_PORTSC_CHANGE_BITS,
+            (initial & !(XHCI_PORTSC_PR | XHCI_PORTSC_CHANGE_BITS))
+                | XHCI_PORTSC_PR
+                | XHCI_PORTSC_CHANGE_BITS,
         );
         if !wait_until("xhci port reset", 100_000, || {
             let value = mmio.read_u32(port_offset);
@@ -1337,7 +1379,9 @@ fn find_xhci_bar(loc: PciLocation) -> Option<XhciBar> {
     while bar_idx < 6 {
         let offset = 0x10 + bar_idx * 4;
         let value = pci_read_u32(loc, offset)?;
-        if (value & 0x1) == 0 && let Some(bar) = probe_mem_bar(loc, bar_idx) {
+        if (value & 0x1) == 0
+            && let Some(bar) = probe_mem_bar(loc, bar_idx)
+        {
             return Some(bar);
         }
         let bar_type = (value >> 1) & 0x3;
@@ -1611,24 +1655,42 @@ fn enumerate_xhci_controller(loc: PciLocation, bar: XhciBar, vendor: u16, device
                     ep0_ctx + XHCI_EP_CTX_DW1,
                     (3 << 1) | (XHCI_EP_TYPE_CONTROL_BIDIR << 3) | (ep0_max_packet_size << 16),
                 );
-                write_dma_u64(input_ctx_virt, ep0_ctx + XHCI_EP_CTX_TR_DEQUEUE_LO, ep0_ring_phys | 1);
+                write_dma_u64(
+                    input_ctx_virt,
+                    ep0_ctx + XHCI_EP_CTX_TR_DEQUEUE_LO,
+                    ep0_ring_phys | 1,
+                );
                 write_dma_u32(input_ctx_virt, ep0_ctx + XHCI_EP_CTX_DW4, 8);
                 let mut ep0_ring_state = TransferRingState {
                     next_index: 0,
                     cycle: XHCI_TRB_CYCLE,
                 };
 
-                    if address_device(
+                if address_device(
+                    &mmio,
+                    dboff,
+                    rtsoff,
+                    &command_ring,
+                    unsafe { &mut *command_ring_state },
+                    &event_ring,
+                    &input_ctx,
+                    slot_id,
+                ) {
+                    if let Some((vendor_id, product_id)) = read_device_descriptor(
                         &mmio,
                         dboff,
                         rtsoff,
-                        &command_ring,
-                        unsafe { &mut *command_ring_state },
                         &event_ring,
-                        &input_ctx,
                         slot_id,
+                        &ep0_ring,
+                        &mut ep0_ring_state,
                     ) {
-                        if let Some((vendor_id, product_id)) = read_device_descriptor(
+                        platform::println!(
+                            "usb-driver: device descriptor vendor=0x{:04x} product=0x{:04x}",
+                            vendor_id,
+                            product_id
+                        );
+                        if let Some(config) = read_configuration_descriptor(
                             &mmio,
                             dboff,
                             rtsoff,
@@ -1637,12 +1699,7 @@ fn enumerate_xhci_controller(loc: PciLocation, bar: XhciBar, vendor: u16, device
                             &ep0_ring,
                             &mut ep0_ring_state,
                         ) {
-                            platform::println!(
-                                "usb-driver: device descriptor vendor=0x{:04x} product=0x{:04x}",
-                                vendor_id,
-                                product_id
-                            );
-                            if let Some(config) = read_configuration_descriptor(
+                            if set_configuration(
                                 &mmio,
                                 dboff,
                                 rtsoff,
@@ -1650,75 +1707,68 @@ fn enumerate_xhci_controller(loc: PciLocation, bar: XhciBar, vendor: u16, device
                                 slot_id,
                                 &ep0_ring,
                                 &mut ep0_ring_state,
+                                config.config_value,
                             ) {
-                                if set_configuration(
-                                    &mmio,
-                                    dboff,
-                                    rtsoff,
-                                    &event_ring,
-                                    slot_id,
-                                    &ep0_ring,
-                                    &mut ep0_ring_state,
-                                    config.config_value,
-                                ) {
-                                    if let Some(ep) = config.interrupt_in {
-                                        let idle_ok = hid_set_idle(
-                                            &mmio,
-                                            rtsoff,
-                                            &event_ring,
-                                            slot_id,
-                                            &ep0_ring,
-                                            &mut ep0_ring_state,
-                                            config.interface_number,
-                                        );
-                                        let protocol_ok = hid_set_protocol(
-                                            &mmio,
-                                            rtsoff,
-                                            &event_ring,
-                                            slot_id,
-                                            &ep0_ring,
-                                            &mut ep0_ring_state,
-                                            config.interface_number,
-                                            1,
-                                        );
-                                        if let Some((ep1_ring, mut ep1_ring_state)) =
-                                            configure_interrupt_in_endpoint(
-                                                &mut ConfigureEndpointCtx {
-                                                    mmio: &mmio,
-                                                    rtsoff,
-                                                    command_ring: &command_ring,
-                                                    ring_state: unsafe { &mut *command_ring_state },
-                                                    event_ring: &event_ring,
-                                                    output_ctx: &output_ctx,
-                                                    input_ctx: &input_ctx,
-                                                    slot_id,
-                                                    hccparams1,
-                                                    root_port,
-                                                    speed_id,
-                                                },
+                                if let Some(ep) = config.interrupt_in {
+                                    let idle_ok = hid_set_idle(
+                                        &mmio,
+                                        rtsoff,
+                                        &event_ring,
+                                        slot_id,
+                                        &ep0_ring,
+                                        &mut ep0_ring_state,
+                                        config.interface_number,
+                                    );
+                                    let protocol_ok = hid_set_protocol(
+                                        &mmio,
+                                        rtsoff,
+                                        &event_ring,
+                                        slot_id,
+                                        &ep0_ring,
+                                        &mut ep0_ring_state,
+                                        config.interface_number,
+                                        1,
+                                    );
+                                    if let Some((ep1_ring, mut ep1_ring_state)) =
+                                        configure_interrupt_in_endpoint(
+                                            &mut ConfigureEndpointCtx {
+                                                mmio: &mmio,
+                                                rtsoff,
+                                                command_ring: &command_ring,
+                                                ring_state: unsafe { &mut *command_ring_state },
+                                                event_ring: &event_ring,
+                                                output_ctx: &output_ctx,
+                                                input_ctx: &input_ctx,
+                                                slot_id,
+                                                hccparams1,
+                                                root_port,
+                                                speed_id,
+                                            },
+                                            ep,
+                                        )
+                                    {
+                                        let mut input_tid = input_service_tid();
+                                        loop {
+                                            if let Some(report) = queue_interrupt_in_transfer(
+                                                &mmio,
+                                                rtsoff,
+                                                &event_ring,
+                                                slot_id,
+                                                &ep1_ring,
+                                                &mut ep1_ring_state,
                                                 ep,
-                                            )
-                                        {
-                                            loop {
-                                                if let Some(report) = queue_interrupt_in_transfer(
-                                                    &mmio,
-                                                    rtsoff,
-                                                    &event_ring,
-                                                    slot_id,
-                                                    &ep1_ring,
-                                                    &mut ep1_ring_state,
-                                                    ep,
-                                                ) {
-                                                    log_hid_input_report(&report, ep);
-                                                }
-                                                platform::thread::yield_now();
+                                            ) {
+                                                log_hid_input_report(&report, ep);
+                                                send_hid_input_report(&mut input_tid, &report, ep);
                                             }
-                                        } else {
-                                            platform::println!(
-                                                "usb-driver: configure interrupt endpoint failed"
-                                            );
+                                            platform::thread::yield_now();
                                         }
+                                    } else {
+                                        platform::println!(
+                                            "usb-driver: configure interrupt endpoint failed"
+                                        );
                                     }
+                                }
                                 if config.report_descriptor_len != 0 {
                                     let _ = read_report_descriptor(
                                         &mmio,
@@ -1726,28 +1776,24 @@ fn enumerate_xhci_controller(loc: PciLocation, bar: XhciBar, vendor: u16, device
                                         rtsoff,
                                         &event_ring,
                                         slot_id,
-                                            &ep0_ring,
-                                            &mut ep0_ring_state,
-                                            config.interface_number,
-                                            config.report_descriptor_len,
-                                        );
-                                    }
-                                } else {
-                                    platform::println!(
-                                        "usb-driver: set configuration failed"
+                                        &ep0_ring,
+                                        &mut ep0_ring_state,
+                                        config.interface_number,
+                                        config.report_descriptor_len,
                                     );
                                 }
                             } else {
-                                platform::println!(
-                                    "usb-driver: configuration descriptor read failed"
-                                );
+                                platform::println!("usb-driver: set configuration failed");
                             }
                         } else {
-                            platform::println!("usb-driver: device descriptor read failed");
+                            platform::println!("usb-driver: configuration descriptor read failed");
                         }
                     } else {
-                        platform::println!("usb-driver: address device timed out or failed");
+                        platform::println!("usb-driver: device descriptor read failed");
                     }
+                } else {
+                    platform::println!("usb-driver: address device timed out or failed");
+                }
             }
         } else {
             platform::println!("usb-driver: enable slot timed out or failed");
@@ -1762,7 +1808,11 @@ fn pci_scan() {
     for bus in 0u8..=255 {
         for device in 0u8..32 {
             for function in 0u8..8 {
-                let loc = PciLocation { bus, device, function };
+                let loc = PciLocation {
+                    bus,
+                    device,
+                    function,
+                };
                 let Some(vendor_device) = pci_read_u32(loc, 0x00) else {
                     continue;
                 };

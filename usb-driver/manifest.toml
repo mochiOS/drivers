@@ -13,6 +13,7 @@ match_bus = "pci"
 match_class = "usb"
 requires = [
     "dma.allocate",
+    "input.pointer",
     "usb.access",
     "memory.phys.map",
 ]
