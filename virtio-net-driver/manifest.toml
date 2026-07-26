@@ -1,0 +1,19 @@
+[package]
+id = "org.mochios.network.virtio-net"
+name = "Virtio Network Driver"
+version = "0.1.0"
+vendor = "mochiOS"
+
+[[binary]]
+path = "/bin/drivers/network/virtio-net.driver/virtio-net.driver"
+kind = "driver"
+driver_class = "network"
+api_version = 1
+match_bus = "pci"
+match_class = "network"
+requires = [
+    "dma.allocate",
+    "device.net",
+    "ipc.server",
+    "memory.phys.map",
+]
