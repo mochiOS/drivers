@@ -15,5 +15,4 @@ requires = [
     "dma.allocate",
     "device.net",
     "ipc.server",
-    "memory.phys.map",
 ]

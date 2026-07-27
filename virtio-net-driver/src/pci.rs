@@ -118,27 +118,33 @@ impl MappedBars {
 }
 impl PciTransportAccess for MappedBars {
     fn read_u8(&mut self, b: u8, o: u32) -> VirtioResult<u8> {
+        // SAFETY: pointer validates the BAR mapping and the complete register range.
         Ok(unsafe { core::ptr::read_volatile(self.pointer(b, o, 1)?) })
     }
     fn read_u16(&mut self, b: u8, o: u32) -> VirtioResult<u16> {
+        // SAFETY: virtio PCI capability register offsets are naturally aligned.
         Ok(u16::from_le(unsafe {
             core::ptr::read_volatile(self.pointer(b, o, 2)?.cast())
         }))
     }
     fn read_u32(&mut self, b: u8, o: u32) -> VirtioResult<u32> {
+        // SAFETY: virtio PCI capability register offsets are naturally aligned.
         Ok(u32::from_le(unsafe {
             core::ptr::read_volatile(self.pointer(b, o, 4)?.cast())
         }))
     }
     fn write_u8(&mut self, b: u8, o: u32, v: u8) -> VirtioResult<()> {
+        // SAFETY: pointer validates the BAR mapping and the complete register range.
         unsafe { core::ptr::write_volatile(self.pointer(b, o, 1)?, v) };
         Ok(())
     }
     fn write_u16(&mut self, b: u8, o: u32, v: u16) -> VirtioResult<()> {
+        // SAFETY: virtio PCI capability register offsets are naturally aligned.
         unsafe { core::ptr::write_volatile(self.pointer(b, o, 2)?.cast(), v.to_le()) };
         Ok(())
     }
     fn write_u32(&mut self, b: u8, o: u32, v: u32) -> VirtioResult<()> {
+        // SAFETY: virtio PCI capability register offsets are naturally aligned.
         unsafe { core::ptr::write_volatile(self.pointer(b, o, 4)?.cast(), v.to_le()) };
         Ok(())
     }

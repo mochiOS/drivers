@@ -5,19 +5,20 @@ use alloc::vec::Vec;
 use mochios_net_device_protocol::{DeviceStatistics, InterfaceInfo, MAX_FRAME_LEN};
 use plugkit::prelude::*;
 use plugkit::virtio::{
-    Descriptor, DmaMemory, FeatureSet, PciTransportAccess, SplitVirtqueue, VIRTIO_F_VERSION_1,
-    VirtioDevice, VirtioError, VirtioPciTransport, VirtqueueLayout,
+    Descriptor, DmaMemory, FeatureSet, PciTransportAccess, SplitVirtqueue, VirtioDevice,
+    VirtioError, VirtioPciTransport, VirtqueueLayout,
+};
+use virtio_net_driver::{
+    REQUESTED_FEATURES, REQUIRED_FEATURES, VIRTIO_NET_HEADER_LEN, received_frame_range,
 };
 
-const VIRTIO_NET_F_MAC: u64 = 1 << 5;
-const VIRTIO_NET_F_STATUS: u64 = 1 << 16;
+const VIRTIO_NET_F_STATUS: u64 = virtio_net_driver::VIRTIO_NET_F_STATUS;
 const RX_QUEUE: u16 = 0;
 const TX_QUEUE: u16 = 1;
 const MAX_QUEUE_SIZE: u16 = 64;
 const RX_BUFFER_COUNT: usize = 32;
 const RX_QUEUE_LIMIT: usize = 64;
-const NET_HEADER_LEN: usize = 10;
-const BUFFER_LEN: usize = NET_HEADER_LEN + MAX_FRAME_LEN;
+const BUFFER_LEN: usize = VIRTIO_NET_HEADER_LEN + MAX_FRAME_LEN;
 
 #[derive(Debug)]
 pub(crate) enum NetError {
@@ -70,9 +71,8 @@ impl NetDevice {
         let device_cfg = caps.device.ok_or(NetError::InvalidConfig)?;
         let mut device = VirtioDevice::new(VirtioPciTransport::new(caps, bars));
         device.begin_initialization()?;
-        let requested =
-            FeatureSet::new(VIRTIO_F_VERSION_1 | VIRTIO_NET_F_MAC | VIRTIO_NET_F_STATUS);
-        let required = FeatureSet::new(VIRTIO_F_VERSION_1 | VIRTIO_NET_F_MAC);
+        let requested = FeatureSet::new(REQUESTED_FEATURES);
+        let required = FeatureSet::new(REQUIRED_FEATURES);
         let negotiated = device.negotiate_features(requested, required)?;
         let mut mac = [0; 6];
         for (i, byte) in mac.iter_mut().enumerate() {
@@ -93,6 +93,8 @@ impl NetDevice {
         };
         let (rx, rx_notify) = make_queue(&mut device, RX_QUEUE)?;
         let (tx, tx_notify) = make_queue(&mut device, TX_QUEUE)?;
+        let rx_buffer_count = RX_BUFFER_COUNT.min(usize::from(rx.size()));
+        let tx_buffer_count = RX_BUFFER_COUNT.min(usize::from(tx.size()));
         device.finish_initialization()?;
         let mut this = Self {
             device,
@@ -100,8 +102,8 @@ impl NetDevice {
             tx,
             rx_notify,
             tx_notify,
-            rx_buffers: Vec::with_capacity(RX_BUFFER_COUNT),
-            tx_buffers: Vec::with_capacity(RX_BUFFER_COUNT),
+            rx_buffers: Vec::with_capacity(rx_buffer_count),
+            tx_buffers: Vec::with_capacity(tx_buffer_count),
             received: VecDeque::with_capacity(RX_QUEUE_LIMIT),
             info: InterfaceInfo {
                 interface_id: 1,
@@ -112,22 +114,23 @@ impl NetDevice {
                 device_id: (u32::from(address.bus) << 16)
                     | (u32::from(address.device) << 8)
                     | u32::from(address.function),
+                driver_name: *b"virtio-net\0\0",
             },
             stats: DeviceStatistics::default(),
         };
-        for _ in 0..RX_BUFFER_COUNT {
+        for _ in 0..rx_buffer_count {
             this.rx_buffers.push(BufferSlot {
                 dma: DmaRegion::allocate(BUFFER_LEN).map_err(NetError::System)?,
                 head: None,
             });
         }
-        for _ in 0..RX_BUFFER_COUNT {
+        for _ in 0..tx_buffer_count {
             this.tx_buffers.push(BufferSlot {
                 dma: DmaRegion::allocate(BUFFER_LEN).map_err(NetError::System)?,
                 head: None,
             });
         }
-        for slot in 0..RX_BUFFER_COUNT {
+        for slot in 0..rx_buffer_count {
             this.post_rx(slot)?;
         }
         this.device
@@ -182,12 +185,14 @@ impl NetDevice {
             self.rx_buffers[slot].head = None;
             self.rx_buffers[slot].dma.sync_for_cpu()?;
             let written = used.written as usize;
-            if written < NET_HEADER_LEN + 14 || written > BUFFER_LEN {
+            let frame_range = received_frame_range(written, BUFFER_LEN);
+            if frame_range.is_err() {
                 self.stats.rx_errors += 1;
             } else if self.received.len() >= RX_QUEUE_LIMIT {
                 self.stats.rx_dropped += 1;
             } else {
-                let frame = self.rx_buffers[slot].dma.bytes()[NET_HEADER_LEN..written].to_vec();
+                let range = frame_range.map_err(|_| NetError::InvalidFrame)?;
+                let frame = self.rx_buffers[slot].dma.bytes()[range].to_vec();
                 self.stats.rx_packets += 1;
                 self.stats.rx_bytes += frame.len() as u64;
                 self.received.push_back(frame)
@@ -224,12 +229,13 @@ impl NetDevice {
             return Err(NetError::QueueExhausted);
         };
         let b = &mut self.tx_buffers[slot];
-        b.dma.bytes_mut()[..NET_HEADER_LEN].fill(0);
-        b.dma.bytes_mut()[NET_HEADER_LEN..NET_HEADER_LEN + frame.len()].copy_from_slice(frame);
+        b.dma.bytes_mut()[..VIRTIO_NET_HEADER_LEN].fill(0);
+        b.dma.bytes_mut()[VIRTIO_NET_HEADER_LEN..VIRTIO_NET_HEADER_LEN + frame.len()]
+            .copy_from_slice(frame);
         b.dma.sync_for_device()?;
         let head = self.tx.enqueue(&[Descriptor {
             address: b.dma.device_address(),
-            length: (NET_HEADER_LEN + frame.len()) as u32,
+            length: (VIRTIO_NET_HEADER_LEN + frame.len()) as u32,
             device_writable: false,
         }])?;
         b.head = Some(head);
@@ -272,16 +278,15 @@ mod tests {
     use super::*;
     #[test]
     fn only_supported_features_are_selected() {
-        let offered = VIRTIO_F_VERSION_1 | VIRTIO_NET_F_MAC | VIRTIO_NET_F_STATUS | 1 | (1 << 15);
-        let accepted = offered & (VIRTIO_F_VERSION_1 | VIRTIO_NET_F_MAC | VIRTIO_NET_F_STATUS);
+        let offered = REQUESTED_FEATURES | 1 | (1 << 15);
         assert_eq!(
-            accepted,
-            VIRTIO_F_VERSION_1 | VIRTIO_NET_F_MAC | VIRTIO_NET_F_STATUS
+            virtio_net_driver::selected_features(offered),
+            Some(REQUESTED_FEATURES)
         )
     }
     #[test]
     fn buffers_are_bounded() {
         assert!(RX_BUFFER_COUNT < RX_QUEUE_LIMIT);
-        assert_eq!(BUFFER_LEN, 1524)
+        assert_eq!(BUFFER_LEN, 1526)
     }
 }
