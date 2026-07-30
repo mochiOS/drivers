@@ -69,11 +69,27 @@ fn send_mouse_command(cmd: u8) -> bool {
     write_command(0xD4) && write_data(cmd) && matches!(read_data_with_timeout(100_000), Some(0xFA))
 }
 
+fn send_mouse_command_with_data(cmd: u8, value: u8) -> bool {
+    send_mouse_command(cmd)
+        && write_command(0xD4)
+        && write_data(value)
+        && matches!(read_data_with_timeout(100_000), Some(0xFA))
+}
+
+fn enable_mouse_wheel() -> bool {
+    for sample_rate in [200, 100, 80] {
+        if !send_mouse_command_with_data(0xF3, sample_rate) {
+            return false;
+        }
+    }
+    send_mouse_command(0xF2) && matches!(read_data_with_timeout(100_000), Some(3))
+}
+
 fn send_keyboard_command(cmd: u8) -> bool {
     write_data(cmd) && matches!(read_data_with_timeout(100_000), Some(0xFA))
 }
 
-fn init_i8042() {
+fn init_i8042() -> bool {
     flush_output_buffer();
 
     let _ = write_command(0xAD);
@@ -101,7 +117,9 @@ fn init_i8042() {
 
     let _ = send_keyboard_command(0xF4);
     let _ = send_mouse_command(0xF6);
+    let wheel_enabled = enable_mouse_wheel();
     let _ = send_mouse_command(0xF4);
+    wheel_enabled
 }
 
 fn input_service_tid() -> u64 {
@@ -253,9 +271,9 @@ pub fn run(sp: *const usize) -> ! {
     unsafe {
         let _ = platform::logger::init_from_initial_stack(sp);
     }
-    init_i8042();
+    let mouse_packet_size = if init_i8042() { 4 } else { 3 };
     let mut input_tid = input_service_tid();
-    let mut mouse_packet = [0u8; 3];
+    let mut mouse_packet = [0u8; 4];
     let mut mouse_packet_len = 0usize;
     let mut reply = [];
 
@@ -302,7 +320,7 @@ pub fn run(sp: *const usize) -> ! {
         }
         mouse_packet[mouse_packet_len] = byte;
         mouse_packet_len += 1;
-        if mouse_packet_len < 3 {
+        if mouse_packet_len < mouse_packet_size {
             continue;
         }
         mouse_packet_len = 0;
@@ -315,7 +333,7 @@ pub fn run(sp: *const usize) -> ! {
             mouse_packet[0],
             mouse_packet[1],
             mouse_packet[2],
-            0,
+            mouse_packet[3],
         ];
         if platform::ipc::call(input_tid, &packet, &mut reply).is_err() {
             input_tid = 0;
