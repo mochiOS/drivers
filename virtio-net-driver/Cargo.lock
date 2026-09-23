@@ -23,6 +23,7 @@ dependencies = [
  "mochi-user-runtime",
  "mochi-user-syscall",
  "mochios-capability-protocol",
+ "mochios-workspace-protocol",
 ]
 
 [[package]]
@@ -47,6 +48,10 @@ version = "0.1.0"
 name = "mochios-net-device-protocol"
 version = "0.1.0"
 source = "git+https://github.com/mochiOS/syscalls#5ecc8a19f932099e72fe9747ac479828d7ecda94"
+
+[[package]]
+name = "mochios-workspace-protocol"
+version = "0.1.0"
 
 [[package]]
 name = "plugkit"

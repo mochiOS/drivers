@@ -23,6 +23,7 @@ dependencies = [
  "mochi-user-runtime",
  "mochi-user-syscall",
  "mochios-capability-protocol",
+ "mochios-workspace-protocol",
 ]
 
 [[package]]
@@ -41,6 +42,10 @@ dependencies = [
 
 [[package]]
 name = "mochios-capability-protocol"
+version = "0.1.0"
+
+[[package]]
+name = "mochios-workspace-protocol"
 version = "0.1.0"
 
 [[package]]
