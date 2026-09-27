@@ -128,13 +128,22 @@ fn input_service_tid() -> u64 {
         .unwrap_or(0)
 }
 
-fn send_keyboard_byte(input_tid: &mut u64, byte: u8, reply: &mut [u8]) {
+fn send_keyboard_byte(input_tid: &mut u64, byte: u8) {
     if *input_tid == 0 {
         return;
     }
     let packet = [platform::input::RAW_KIND_KEYBOARD, 0, 0, 0, byte, 0, 0, 0];
-    if platform::ipc::call(*input_tid, &packet, reply).is_err() {
-        *input_tid = 0;
+    loop {
+        match platform::ipc::send(*input_tid, &packet) {
+            Ok(_) => return,
+            Err(error) if error.errno() == Some(mochi_user_syscall::EAGAIN) => {
+                platform::thread::yield_now();
+            }
+            Err(_) => {
+                *input_tid = 0;
+                return;
+            }
+        }
     }
 }
 
@@ -235,21 +244,21 @@ fn ascii_to_set1(byte: u8) -> Option<(u8, bool)> {
     })
 }
 
-fn send_ascii_key(input_tid: &mut u64, byte: u8, reply: &mut [u8]) {
+fn send_ascii_key(input_tid: &mut u64, byte: u8) {
     let Some((scancode, needs_shift)) = ascii_to_set1(byte) else {
         return;
     };
     if needs_shift {
-        send_keyboard_byte(input_tid, SCANCODE_LEFT_SHIFT, reply);
+        send_keyboard_byte(input_tid, SCANCODE_LEFT_SHIFT);
     }
-    send_keyboard_byte(input_tid, scancode, reply);
-    send_keyboard_byte(input_tid, scancode | 0x80, reply);
+    send_keyboard_byte(input_tid, scancode);
+    send_keyboard_byte(input_tid, scancode | 0x80);
     if needs_shift {
-        send_keyboard_byte(input_tid, SCANCODE_LEFT_SHIFT | 0x80, reply);
+        send_keyboard_byte(input_tid, SCANCODE_LEFT_SHIFT | 0x80);
     }
 }
 
-fn poll_serial_keyboard(input_tid: &mut u64, reply: &mut [u8]) {
+fn poll_serial_keyboard(input_tid: &mut u64) {
     loop {
         let Ok(status) = platform::port::in_u8(SERIAL_COM1_LINE_STATUS) else {
             return;
@@ -260,7 +269,7 @@ fn poll_serial_keyboard(input_tid: &mut u64, reply: &mut [u8]) {
         let Ok(byte) = platform::port::in_u8(SERIAL_COM1_DATA) else {
             return;
         };
-        send_ascii_key(input_tid, byte, reply);
+        send_ascii_key(input_tid, byte);
         if *input_tid == 0 {
             return;
         }
@@ -284,7 +293,7 @@ pub fn run(sp: *const usize) -> ! {
             continue;
         }
 
-        poll_serial_keyboard(&mut input_tid, &mut reply);
+        poll_serial_keyboard(&mut input_tid);
         if input_tid == 0 {
             continue;
         }
@@ -311,7 +320,7 @@ pub fn run(sp: *const usize) -> ! {
         };
 
         if (status & STATUS_AUX_DATA) == 0 {
-            send_keyboard_byte(&mut input_tid, byte, &mut reply);
+            send_keyboard_byte(&mut input_tid, byte);
             continue;
         }
 
