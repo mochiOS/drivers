@@ -6,7 +6,7 @@ version = "0.1.0"
 vendor = "mochiOS"
 
 [[binary]]
-path = "/bin/drivers/ps2/i8042.driver/entry.elf"
+path = "/system/bin/drivers/ps2/i8042.driver/entry.elf"
 kind = "driver"
 driver_class = "input"
 api_version = 1
