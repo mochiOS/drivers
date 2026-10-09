@@ -14,11 +14,6 @@ const PCI_CFG_DATA: u16 = 0xCFC;
 const XHCI_PROG_IF: u8 = 0x30;
 const INPUT_SERVICE_NAME: &str = "input.service";
 
-const PROT_READ: u64 = 0x1;
-const PROT_WRITE: u64 = 0x2;
-const MAP_PRIVATE: u64 = 0x2;
-const MAP_ANONYMOUS: u64 = 0x20;
-
 const XHCI_CAP_CAPLENGTH: usize = 0x00;
 const XHCI_CAP_HCIVERSION: usize = 0x02;
 const XHCI_CAP_HCSPARAMS1: usize = 0x04;
@@ -154,11 +149,11 @@ impl MmioRegion {
             .checked_add(len as usize)
             .ok_or_else(|| syscall::SysError::from_raw(syscall::EINVAL as i64))?;
         let map_len = ((span + 0xfff) & !0xfff) as u64;
-        let virt_base = platform::memory::mmap(
+        let virt_base = platform::memory::map(
             0,
             map_len,
-            PROT_READ | PROT_WRITE,
-            MAP_PRIVATE | MAP_ANONYMOUS,
+            syscall::MEMORY_ACCESS_READ | syscall::MEMORY_ACCESS_WRITE,
+            0,
             0,
         )?;
         platform::memory::map_physical_range(virt_base, page_base, map_len)?;
