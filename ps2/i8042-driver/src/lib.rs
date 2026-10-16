@@ -136,7 +136,7 @@ fn send_keyboard_byte(input_tid: &mut u64, byte: u8) {
     loop {
         match platform::ipc::send(*input_tid, &packet) {
             Ok(_) => return,
-            Err(error) if error.errno() == Some(mochi_user_syscall::EAGAIN) => {
+            Err(error) if error.raw() == mochi_user_syscall::EAGAIN as i64 => {
                 platform::thread::yield_now();
             }
             Err(_) => {

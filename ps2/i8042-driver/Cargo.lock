@@ -61,7 +61,6 @@ version = "0.1.0"
 [[package]]
 name = "plugkit"
 version = "0.1.0"
-source = "git+https://github.com/mochiOS/mnu#a5dc118db84c4a303ac74457c0feb78f4cd6dcba"
 dependencies = [
  "plugkit-macros",
  "plugkit-sys",
@@ -70,12 +69,10 @@ dependencies = [
 [[package]]
 name = "plugkit-macros"
 version = "0.1.0"
-source = "git+https://github.com/mochiOS/mnu#a5dc118db84c4a303ac74457c0feb78f4cd6dcba"
 
 [[package]]
 name = "plugkit-sys"
 version = "0.1.0"
-source = "git+https://github.com/mochiOS/mnu#a5dc118db84c4a303ac74457c0feb78f4cd6dcba"
 dependencies = [
  "spin",
 ]
@@ -94,3 +91,71 @@ checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 dependencies = [
  "lock_api",
 ]
+
+[[patch.unused]]
+name = "mboot-protocol"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "libc"
+version = "0.2.190"
+
+[[patch.unused]]
+name = "viewkit"
+version = "2.0.0"
+
+[[patch.unused]]
+name = "libc"
+version = "0.2.190"
+
+[[patch.unused]]
+name = "mochios-mdriver-protocol"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "rustc-std-workspace-alloc"
+version = "1.99.0"
+
+[[patch.unused]]
+name = "rustc-std-workspace-std"
+version = "1.99.0"
+
+[[patch.unused]]
+name = "viewkit"
+version = "2.0.0"
+
+[[patch.unused]]
+name = "mochios-filesystem-protocol"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-linux-gui-protocol"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-linux-portal-protocol"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-signature-protocol"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-tls-client"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-user-database"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-user-protocol"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-viewkit-gpu-protocol"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-virtio-gpu-protocol"
+version = "0.1.0"
