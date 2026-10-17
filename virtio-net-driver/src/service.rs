@@ -56,7 +56,9 @@ pub(crate) fn run() -> ! {
                     let _ = platform::ipc::reply(sender, &reply[..n]);
                 }
             }
-            Err(error) if error.raw() == mochi_user_syscall::EAGAIN as i64 => {
+            Err(error)
+                if error.native_error() == Some(mochi_user_syscall::NativeError::NotReady) =>
+            {
                 platform::thread::yield_now()
             }
             Err(_) => platform::thread::yield_now(),
