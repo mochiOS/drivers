@@ -61,6 +61,7 @@ version = "0.1.0"
 [[package]]
 name = "plugkit"
 version = "0.1.0"
+source = "git+https://github.com/mochiOS/mnu#91a1f075f743385845c57725323cfa20ff585343"
 dependencies = [
  "plugkit-macros",
  "plugkit-sys",
@@ -69,10 +70,12 @@ dependencies = [
 [[package]]
 name = "plugkit-macros"
 version = "0.1.0"
+source = "git+https://github.com/mochiOS/mnu#91a1f075f743385845c57725323cfa20ff585343"
 
 [[package]]
 name = "plugkit-sys"
 version = "0.1.0"
+source = "git+https://github.com/mochiOS/mnu#91a1f075f743385845c57725323cfa20ff585343"
 dependencies = [
  "spin",
 ]
@@ -97,6 +100,10 @@ name = "mboot-protocol"
 version = "0.1.0"
 
 [[patch.unused]]
+name = "mnu"
+version = "0.1.0"
+
+[[patch.unused]]
 name = "libc"
 version = "0.2.190"
 
@@ -107,18 +114,6 @@ version = "2.0.0"
 [[patch.unused]]
 name = "libc"
 version = "0.2.190"
-
-[[patch.unused]]
-name = "mochios-mdriver-protocol"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "rustc-std-workspace-alloc"
-version = "1.99.0"
-
-[[patch.unused]]
-name = "rustc-std-workspace-std"
-version = "1.99.0"
 
 [[patch.unused]]
 name = "viewkit"
@@ -134,6 +129,18 @@ version = "0.1.0"
 
 [[patch.unused]]
 name = "mochios-linux-portal-protocol"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-net-device-protocol"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-posix-client"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-posix-protocol"
 version = "0.1.0"
 
 [[patch.unused]]
