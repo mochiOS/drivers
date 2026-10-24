@@ -156,17 +156,18 @@ impl Drop for MappedBars {
         }
     }
 }
-pub(crate) fn connect() -> VirtioResult<(VirtioPciCapabilities, MappedBars, PciAddress)> {
+pub(crate) fn connect() -> VirtioResult<Option<(VirtioPciCapabilities, MappedBars, PciAddress)>> {
     let mut ports = PciPorts;
-    let dev = find_pci_device(&mut ports, VIRTIO_VENDOR_ID, VIRTIO_NET_DEVICE_ID)?
-        .ok_or(VirtioError::QueueUnavailable)?;
+    let Some(dev) = find_pci_device(&mut ports, VIRTIO_VENDOR_ID, VIRTIO_NET_DEVICE_ID)? else {
+        return Ok(None);
+    };
     let address = dev.address;
     let bars = dev.probe_bars(&mut ports)?;
     let config: PciConfig = dev.read_config(&mut ports)?;
     let caps = VirtioPciCapabilities::parse(&config, &bars)?;
     let mapped = MappedBars::map(&bars, caps)?;
     dev.enable_memory_and_bus_master(&mut ports)?;
-    Ok((caps, mapped, address))
+    Ok(Some((caps, mapped, address)))
 }
 fn required(c: VirtioPciCapabilities) -> [Option<CapabilityRegion>; 4] {
     [Some(c.common), Some(c.notify), Some(c.isr), c.device]

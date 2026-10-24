@@ -22,6 +22,7 @@ const BUFFER_LEN: usize = VIRTIO_NET_HEADER_LEN + MAX_FRAME_LEN;
 
 #[derive(Debug)]
 pub(crate) enum NetError {
+    Unavailable,
     Virtio(VirtioError),
     System(u64),
     InvalidConfig,
@@ -37,6 +38,9 @@ impl From<VirtioError> for NetError {
 impl NetError {
     pub(crate) fn errno(&self) -> u64 {
         match self {
+            Self::Unavailable => {
+                mochios_net_device_protocol::STATUS_NETWORK_UNAVAILABLE as i64 as u64
+            }
             Self::Virtio(error) => {
                 let _ = error;
                 mochi_user_syscall::EIO
@@ -67,7 +71,7 @@ pub(crate) struct NetDevice {
 
 impl NetDevice {
     pub(crate) fn initialize() -> Result<Self, NetError> {
-        let (caps, bars, address) = pci::connect()?;
+        let (caps, bars, address) = pci::connect()?.ok_or(NetError::Unavailable)?;
         let device_cfg = caps.device.ok_or(NetError::InvalidConfig)?;
         let mut device = VirtioDevice::new(VirtioPciTransport::new(caps, bars));
         device.begin_initialization()?;

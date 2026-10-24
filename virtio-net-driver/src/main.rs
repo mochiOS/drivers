@@ -7,6 +7,7 @@ use core::arch::global_asm;
 
 mod device;
 mod dma;
+mod failure;
 mod pci;
 mod service;
 

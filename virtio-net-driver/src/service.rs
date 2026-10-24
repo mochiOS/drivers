@@ -9,40 +9,45 @@ const REQUEST_BUFFER_LEN: usize = HEADER_LEN + 4 + MAX_FRAME_LEN;
 const REPLY_BUFFER_LEN: usize = REQUEST_BUFFER_LEN;
 pub(crate) fn run() -> ! {
     platform::println!("virtio-net.driver: start");
-    let mut device = match NetDevice::initialize() {
-        Ok(d) => d,
-        Err(e) => {
-            platform::println!(
-                "virtio-net.driver: initialization failed error={:?} errno={}",
-                e,
-                e.errno()
-            );
-            idle()
+    let (mut device, mut failure) = match NetDevice::initialize() {
+        Ok(device) => (Some(device), None),
+        Err(error) => {
+            let _ = platform::logger::write_status_fmt(format_args!(
+                "virtio-net.driver: initialization failed error={error:?} status={}\n",
+                error.errno() as i64
+            ));
+            (None, Some(error.errno() as i32))
         }
     };
-    let info = device.info();
-    platform::println!(
-        "virtio-net.driver: ready mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} link={} mtu={}",
-        info.mac[0],
-        info.mac[1],
-        info.mac[2],
-        info.mac[3],
-        info.mac[4],
-        info.mac[5],
-        info.link_up,
-        info.mtu
-    );
+    if let Some(device) = device.as_ref() {
+        let info = device.info();
+        platform::println!(
+            "virtio-net.driver: ready mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} link={} mtu={}",
+            info.mac[0],
+            info.mac[1],
+            info.mac[2],
+            info.mac[3],
+            info.mac[4],
+            info.mac[5],
+            info.link_up,
+            info.mtu
+        );
+    }
     let mut request = [0u8; REQUEST_BUFFER_LEN];
     let mut reply = [0u8; REPLY_BUFFER_LEN];
     loop {
-        if let Err(error) = device.poll() {
-            platform::println!(
-                "virtio-net.driver: queue error={:?} errno={}",
-                error,
-                error.errno()
-            );
-            device.fail();
-            idle()
+        if failure.is_none() {
+            if let Some(device) = device.as_mut() {
+                if let Err(error) = device.poll() {
+                    let _ = platform::logger::write_status_fmt(format_args!(
+                        "virtio-net.driver: queue failed error={error:?}\n"
+                    ));
+                    device.fail();
+                    // Retain DMA ownership while the failed device may still
+                    // hold its queue addresses. Respond instead of spinning idle.
+                    failure = Some(error.errno() as i32);
+                }
+            }
         }
         match platform::ipc::try_wait(&mut request) {
             Ok(message) => {
@@ -51,7 +56,15 @@ pub(crate) fn run() -> ! {
                 let Some(bytes) = request.get(..len) else {
                     continue;
                 };
-                let reply_len = handle(&mut device, bytes, &mut reply);
+                let reply_len = if platform::capability::check_thread(sender, "net.raw") != Ok(1) {
+                    crate::failure::reply(-13, bytes, &mut reply)
+                } else if let Some(status) = failure {
+                    crate::failure::reply(status, bytes, &mut reply)
+                } else {
+                    device
+                        .as_mut()
+                        .and_then(|device| handle(device, bytes, &mut reply))
+                };
                 if let Some(n) = reply_len {
                     let _ = platform::ipc::reply(sender, &reply[..n]);
                 }
@@ -118,10 +131,5 @@ fn handle(device: &mut NetDevice, request: &[u8], reply: &mut [u8]) -> Option<us
             .ok()
         }
         _ => None,
-    }
-}
-fn idle() -> ! {
-    loop {
-        platform::thread::yield_now()
     }
 }
