@@ -12,7 +12,6 @@ use plugkit::prelude::*;
 const PCI_CFG_ADDR: u16 = 0xCF8;
 const PCI_CFG_DATA: u16 = 0xCFC;
 const XHCI_PROG_IF: u8 = 0x30;
-const INPUT_SERVICE_NAME: &str = "input.service";
 
 const XHCI_CAP_CAPLENGTH: usize = 0x00;
 const XHCI_CAP_HCIVERSION: usize = 0x02;
@@ -928,8 +927,8 @@ fn log_hid_input_report(report: &DmaPage, ep: InterruptEndpointInfo) {
 }
 
 fn input_service_tid() -> u64 {
-    platform::process::find_by_name(INPUT_SERVICE_NAME)
-        .ok()
+    platform::handle::inherited(platform::input::RAW_INPUT_HANDLE_KEY)
+        .map(u64::from)
         .unwrap_or(0)
 }
 
@@ -954,7 +953,14 @@ fn send_hid_input_report(input_tid: &mut u64, report: &DmaPage, ep: InterruptEnd
     packet[6..8].copy_from_slice(&x.to_le_bytes());
     packet[8..10].copy_from_slice(&y.to_le_bytes());
     let mut reply = [];
-    if platform::ipc::call(*input_tid, &packet, &mut reply).is_err() {
+    if platform::ipc::call_object_handles(
+        *input_tid as u32,
+        &packet,
+        &mut reply,
+        &mut platform::ipc::IpcObjectHandles::default(),
+    )
+    .is_err()
+    {
         *input_tid = 0;
     }
 }

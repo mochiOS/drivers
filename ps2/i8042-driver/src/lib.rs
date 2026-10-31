@@ -5,7 +5,6 @@ use mochi_user_platform as platform;
 const STATUS_OUTPUT_FULL: u8 = 1 << 0;
 const STATUS_INPUT_FULL: u8 = 1 << 1;
 const STATUS_AUX_DATA: u8 = 1 << 5;
-const INPUT_SERVICE_NAME: &str = "input.service";
 const SERIAL_COM1_DATA: u16 = 0x3F8;
 const SERIAL_COM1_LINE_STATUS: u16 = 0x3FD;
 const SERIAL_LINE_STATUS_DATA_READY: u8 = 1 << 0;
@@ -122,19 +121,44 @@ fn init_i8042() -> bool {
     wheel_enabled
 }
 
-fn input_service_tid() -> u64 {
-    platform::process::find_by_name(INPUT_SERVICE_NAME)
-        .ok()
+fn input_endpoint() -> u64 {
+    platform::handle::inherited(platform::input::RAW_INPUT_HANDLE_KEY)
+        .map(u64::from)
         .unwrap_or(0)
 }
 
 fn send_keyboard_byte(input_tid: &mut u64, byte: u8) {
+    send_keyboard_packet(input_tid, byte, false);
+}
+
+fn send_serial_byte(input_tid: &mut u64, byte: u8) {
+    send_keyboard_packet(input_tid, byte, true);
+}
+
+fn send_keyboard_packet(input_tid: &mut u64, byte: u8, synthetic: bool) {
     if *input_tid == 0 {
         return;
     }
-    let packet = [platform::input::RAW_KIND_KEYBOARD, 0, 0, 0, byte, 0, 0, 0];
+    let packet = [
+        platform::input::RAW_KIND_KEYBOARD,
+        if synthetic {
+            platform::input::RAW_FLAG_SYNTHETIC
+        } else {
+            0
+        },
+        0,
+        0,
+        byte,
+        0,
+        0,
+        0,
+    ];
     loop {
-        match platform::ipc::send(*input_tid, &packet) {
+        match platform::ipc::send_object_handles(
+            *input_tid,
+            &packet,
+            &platform::ipc::IpcObjectHandles::default(),
+        ) {
             Ok(_) => return,
             Err(error)
                 if error.native_error() == Some(mochi_user_syscall::NativeError::NotReady) =>
@@ -251,12 +275,12 @@ fn send_ascii_key(input_tid: &mut u64, byte: u8) {
         return;
     };
     if needs_shift {
-        send_keyboard_byte(input_tid, SCANCODE_LEFT_SHIFT);
+        send_serial_byte(input_tid, SCANCODE_LEFT_SHIFT);
     }
-    send_keyboard_byte(input_tid, scancode);
-    send_keyboard_byte(input_tid, scancode | 0x80);
+    send_serial_byte(input_tid, scancode);
+    send_serial_byte(input_tid, scancode | 0x80);
     if needs_shift {
-        send_keyboard_byte(input_tid, SCANCODE_LEFT_SHIFT | 0x80);
+        send_serial_byte(input_tid, SCANCODE_LEFT_SHIFT | 0x80);
     }
 }
 
@@ -283,16 +307,15 @@ pub fn run(sp: *const usize) -> ! {
         let _ = platform::logger::init_from_initial_stack(sp);
     }
     let mouse_packet_size = if init_i8042() { 4 } else { 3 };
-    let mut input_tid = input_service_tid();
+    let mut input_tid = input_endpoint();
     let mut mouse_packet = [0u8; 4];
     let mut mouse_packet_len = 0usize;
     let mut reply = [];
 
     loop {
         if input_tid == 0 {
-            input_tid = input_service_tid();
-            platform::thread::yield_now();
-            continue;
+            // A lost delegated endpoint is not replaced through global discovery.
+            platform::process::exit(1);
         }
 
         poll_serial_keyboard(&mut input_tid);
@@ -346,7 +369,10 @@ pub fn run(sp: *const usize) -> ! {
             mouse_packet[2],
             mouse_packet[3],
         ];
-        if platform::ipc::call(input_tid, &packet, &mut reply).is_err() {
+        if platform::ipc::call_object_handles(
+            input_tid as u32, &packet, &mut reply,
+            &mut platform::ipc::IpcObjectHandles::default(),
+        ).is_err() {
             input_tid = 0;
         }
     }
