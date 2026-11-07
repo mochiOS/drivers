@@ -94,8 +94,8 @@ fn handle(device: &mut NetDevice, request: &[u8], reply: &mut [u8]) -> Option<us
             let (id, frame) = decode_frame(Opcode::TransmitFrame, request).ok()?;
             let status = match device.transmit(frame) {
                 Ok(()) => 0,
-                Err(NetError::QueueExhausted) => -(mochi_user_syscall::EAGAIN as i32),
-                Err(_) => -(mochi_user_syscall::EIO as i32),
+                Err(NetError::QueueExhausted) => mochi_user_syscall::EAGAIN as i32,
+                Err(_) => mochi_user_syscall::EIO as i32,
             };
             encode_status(
                 Opcode::TransmitComplete,
@@ -114,7 +114,7 @@ fn handle(device: &mut NetDevice, request: &[u8], reply: &mut [u8]) -> Option<us
                 None => encode_status(
                     Opcode::FrameReceived,
                     header.request_id,
-                    -(mochi_user_syscall::EAGAIN as i32),
+                    mochi_user_syscall::EAGAIN as i32,
                     &mut reply[..STATUS_LEN],
                 )
                 .ok(),
