@@ -16,5 +16,5 @@ requires = [
     "dma.allocate",
     "input.pointer",
     "usb.access",
-    "memory.phys.map",
+    "ipc.client",
 ]

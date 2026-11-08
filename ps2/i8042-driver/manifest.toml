@@ -14,6 +14,10 @@ match_bus = "platform"
 match_class = "i8042"
 requires = [
     "device.input",
+    "io.port@0x60:1",
+    "io.port@0x64:1",
+    "io.port@0x3f8:1",
+    "io.port@0x3fd:1",
     "ipc.client",
     "ipc.server",
 ]

@@ -15,5 +15,6 @@ match_class = "network"
 requires = [
     "dma.allocate",
     "device.net",
+    "ipc.client",
     "ipc.server",
 ]

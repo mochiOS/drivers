@@ -5,50 +5,29 @@ use plugkit::virtio::{
     VirtioPciCapabilities, VirtioResult, find_pci_device,
 };
 
-const PCI_CONFIG_ADDRESS: u16 = 0x0cf8;
-const PCI_CONFIG_DATA: u16 = 0x0cfc;
 pub(crate) const VIRTIO_VENDOR_ID: u16 = 0x1af4;
 pub(crate) const VIRTIO_NET_DEVICE_ID: u16 = 0x1041;
 const MMIO_VIRTUAL_BASE: u64 = 0x0000_6200_0000_0000;
 const MMIO_BAR_SPACING: u64 = 0x0200_0000;
 const MAX_MAPPED_BAR_SIZE: u64 = 0x0100_0000;
 
-pub(crate) struct PciPorts;
-impl PciPorts {
-    fn address(a: PciAddress, o: u16) -> VirtioResult<u32> {
-        if o >= 256 || o & 3 != 0 {
-            return Err(VirtioError::AccessFailed);
-        }
-        Ok(0x8000_0000
-            | (u32::from(a.bus) << 16)
-            | (u32::from(a.device) << 11)
-            | (u32::from(a.function) << 8)
-            | u32::from(o))
-    }
-    fn read(port: u16) -> VirtioResult<u32> {
-        platform::syscall::call2(platform::syscall::SyscallNumber::PortIn, u64::from(port), 4)
-            .map(|v| v as u32)
+pub(crate) struct PciPorts(platform::pci::Config);
+impl PciConfigIo for PciPorts {
+    fn read_u32(&mut self, address: PciAddress, offset: u16) -> VirtioResult<u32> {
+        let address = (u32::from(address.bus) << 16)
+            | (u32::from(address.device) << 11)
+            | (u32::from(address.function) << 8);
+        self.0
+            .read(address, offset)
             .map_err(|_| VirtioError::AccessFailed)
     }
-    fn write(port: u16, v: u32) -> VirtioResult<()> {
-        platform::syscall::call3(
-            platform::syscall::SyscallNumber::PortOut,
-            u64::from(port),
-            u64::from(v),
-            4,
-        )
-        .map(|_| ())
-        .map_err(|_| VirtioError::AccessFailed)
-    }
-}
-impl PciConfigIo for PciPorts {
-    fn read_u32(&mut self, a: PciAddress, o: u16) -> VirtioResult<u32> {
-        Self::write(PCI_CONFIG_ADDRESS, Self::address(a, o)?)?;
-        Self::read(PCI_CONFIG_DATA)
-    }
-    fn write_u32(&mut self, a: PciAddress, o: u16, v: u32) -> VirtioResult<()> {
-        Self::write(PCI_CONFIG_ADDRESS, Self::address(a, o)?)?;
-        Self::write(PCI_CONFIG_DATA, v)
+    fn write_u32(&mut self, address: PciAddress, offset: u16, value: u32) -> VirtioResult<()> {
+        let address = (u32::from(address.bus) << 16)
+            | (u32::from(address.device) << 11)
+            | (u32::from(address.function) << 8);
+        self.0
+            .write(address, offset, value)
+            .map_err(|_| VirtioError::AccessFailed)
     }
 }
 
@@ -157,7 +136,7 @@ impl Drop for MappedBars {
     }
 }
 pub(crate) fn connect() -> VirtioResult<Option<(VirtioPciCapabilities, MappedBars, PciAddress)>> {
-    let mut ports = PciPorts;
+    let mut ports = PciPorts(platform::pci::Config::default());
     let Some(dev) = find_pci_device(&mut ports, VIRTIO_VENDOR_ID, VIRTIO_NET_DEVICE_ID)? else {
         return Ok(None);
     };

@@ -9,8 +9,6 @@ use mochi_user_platform as platform;
 use mochi_user_syscall as syscall;
 use plugkit::prelude::*;
 
-const PCI_CFG_ADDR: u16 = 0xCF8;
-const PCI_CFG_DATA: u16 = 0xCFC;
 const XHCI_PROG_IF: u8 = 0x30;
 
 const XHCI_CAP_CAPLENGTH: usize = 0x00;
@@ -228,7 +226,6 @@ static mut XHCI_COMMAND_RING_STATE: CommandRingState = CommandRingState {
     cycle: XHCI_TRB_CYCLE,
 };
 static mut XHCI_DOORBELL_BASE: usize = 0;
-static mut PCI_CONFIG_IO_FAILED_LOGGED: bool = false;
 
 impl DmaPage {
     fn allocate(len: usize) -> Result<Self, syscall::SysError> {
@@ -1259,54 +1256,14 @@ fn reset_port(mmio: &MmioRegion, port_offset: usize, port_index: usize) -> Optio
     Some(mmio.read_u32(port_offset))
 }
 
-fn port_in(port: u16, width: u64) -> Result<u64, syscall::SysError> {
-    syscall::call2(syscall::SyscallNumber::PortIn, port as u64, width)
+fn pci_address(loc: PciLocation) -> u32 {
+    (u32::from(loc.bus) << 16) | (u32::from(loc.device) << 11) | (u32::from(loc.function) << 8)
 }
-
-fn port_out(port: u16, value: u64, width: u64) -> Result<u64, syscall::SysError> {
-    syscall::call3(syscall::SyscallNumber::PortOut, port as u64, value, width)
-}
-
-fn pci_config_address(loc: PciLocation, offset: u8) -> u32 {
-    0x8000_0000
-        | ((loc.bus as u32) << 16)
-        | ((loc.device as u32) << 11)
-        | ((loc.function as u32) << 8)
-        | ((offset as u32) & 0xFC)
-}
-
 fn pci_read_u32(loc: PciLocation, offset: u8) -> Option<u32> {
-    let addr = pci_config_address(loc, offset);
-    if port_out(PCI_CFG_ADDR, addr as u64, 4).is_err() {
-        // SAFETY: best-effort single log for diagnosis in single-threaded startup path.
-        unsafe {
-            if !PCI_CONFIG_IO_FAILED_LOGGED {
-                PCI_CONFIG_IO_FAILED_LOGGED = true;
-                platform::println!("usb-driver: pci config io denied");
-            }
-        }
-        return None;
-    }
-    let value = match port_in(PCI_CFG_DATA, 4) {
-        Ok(v) => v,
-        Err(_) => {
-            // SAFETY: best-effort single log for diagnosis in single-threaded startup path.
-            unsafe {
-                if !PCI_CONFIG_IO_FAILED_LOGGED {
-                    PCI_CONFIG_IO_FAILED_LOGGED = true;
-                    platform::println!("usb-driver: pci config io denied");
-                }
-            }
-            return None;
-        }
-    };
-    Some(value as u32)
+    platform::pci::Config::default().read(pci_address(loc), u16::from(offset)).ok()
 }
-
 fn pci_write_u32(loc: PciLocation, offset: u8, value: u32) -> bool {
-    let addr = pci_config_address(loc, offset);
-    port_out(PCI_CFG_ADDR, addr as u64, 4).is_ok()
-        && port_out(PCI_CFG_DATA, value as u64, 4).is_ok()
+    platform::pci::Config::default().write(pci_address(loc), u16::from(offset), value).is_ok()
 }
 
 fn pci_read_u16(loc: PciLocation, offset: u8) -> Option<u16> {
