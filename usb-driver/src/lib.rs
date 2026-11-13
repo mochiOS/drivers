@@ -2,6 +2,8 @@
 
 extern crate alloc;
 
+mod pci_bar;
+
 use alloc::format;
 use core::mem::size_of;
 use core::ptr::{read_volatile, write_volatile};
@@ -1317,19 +1319,21 @@ fn probe_mem_bar(loc: PciLocation, bar_idx: u8) -> Option<XhciBar> {
         0
     };
 
-    let base = if is_64 {
-        ((original_high as u64) << 32) | ((original_low & 0xffff_fff0) as u64)
+    // Config emulates all-ones probes using the PCI owner's cached masks;
+    // these writes never reprogram a live hardware BAR. Keep one Config for
+    // the full probe so its local sizing state survives until both reads.
+    let address = pci_address(loc);
+    let mut config = platform::pci::Config::default();
+    config.write(address, u16::from(offset), u32::MAX).ok()?;
+    let mask_low = config.read(address, u16::from(offset)).ok()?;
+    let mask_high = if is_64 {
+        config.write(address, u16::from(offset + 4), u32::MAX).ok()?;
+        config.read(address, u16::from(offset + 4)).ok()?
     } else {
-        (original_low & 0xffff_fff0) as u64
+        0
     };
-    if base == 0 {
-        return None;
-    }
-
-    Some(XhciBar {
-        phys_base: base,
-        size: 0x1_0000,
-    })
+    let (phys_base, size) = pci_bar::memory_extent(original_low, original_high, mask_low, mask_high)?;
+    Some(XhciBar { phys_base, size })
 }
 
 fn find_xhci_bar(loc: PciLocation) -> Option<XhciBar> {
