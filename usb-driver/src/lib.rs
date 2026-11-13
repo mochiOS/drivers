@@ -1384,12 +1384,11 @@ fn enumerate_xhci_controller(loc: PciLocation, bar: XhciBar, vendor: u16, device
     let map_len = core::cmp::min(bar.size, 0x10000);
     let mmio = match MmioRegion::map(bar.phys_base, map_len) {
         Ok(region) => region,
-        Err(_) => {
-            platform::println!(
-                "usb-driver: failed to map xHCI MMIO bar phys=0x{:016x} size=0x{:x}",
-                bar.phys_base,
-                bar.size
-            );
+        Err(error) => {
+            let _ = platform::logger::write_status_fmt(format_args!(
+                "usb-driver: MMIO mapping failed address={:#x} size={:#x} error={error:?}\n",
+                bar.phys_base, map_len
+            ));
             return;
         }
     };
@@ -1445,7 +1444,7 @@ fn enumerate_xhci_controller(loc: PciLocation, bar: XhciBar, vendor: u16, device
         rtsoff
     );
     if !xhci_stop_and_reset(&mmio, cap_length) {
-        platform::println!("usb-driver: xhci reset failed");
+        let _ = platform::logger::write_status_fmt(format_args!("usb-driver: xhci reset failed\n"));
         return;
     }
     let dcbaa = match DmaPage::allocate(4096) {
@@ -1821,6 +1820,10 @@ fn pci_scan() {
                 spec.properties
                     .insert("pci.prog_if".into(), DeviceProperty::U32(prog_if as u32));
 
+                let _ = platform::logger::write_status_fmt(format_args!(
+                    "usb-driver: xHCI selected address={:#x} size={:#x}\n",
+                    bar.phys_base, bar.size
+                ));
                 let dev = register_device(spec);
                 let _ = UsbDriver::start(dev, PlugKitResources::empty());
                 found += 1;
@@ -1891,8 +1894,8 @@ impl PlugKitDriver for UsbDriver {
 }
 
 pub fn run() -> ! {
-    platform::println!("usb-driver: start");
+    let _ = platform::logger::write_status_fmt(format_args!("usb-driver: start\n"));
     pci_scan();
-    platform::println!("usb-driver: enumeration complete");
+    let _ = platform::logger::write_status_fmt(format_args!("usb-driver: enumeration complete\n"));
     platform::process::exit(0)
 }
