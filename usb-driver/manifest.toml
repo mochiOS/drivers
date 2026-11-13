@@ -17,4 +17,6 @@ requires = [
     "input.pointer",
     "usb.access",
     "ipc.client",
+    # Authenticate the PCI authority before mediated configuration requests.
+    "process.inspect",
 ]

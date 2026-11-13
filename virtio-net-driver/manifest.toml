@@ -17,4 +17,6 @@ requires = [
     "device.net",
     "ipc.client",
     "ipc.server",
+    # Authenticate the PCI authority before mediated configuration requests.
+    "process.inspect",
 ]
