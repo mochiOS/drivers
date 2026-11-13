@@ -3,6 +3,7 @@
 extern crate alloc;
 
 mod pci_bar;
+mod mmio_address;
 
 use alloc::format;
 use core::mem::size_of;
@@ -148,13 +149,10 @@ impl MmioRegion {
             .checked_add(len as usize)
             .ok_or_else(|| syscall::SysError::from_raw(syscall::EINVAL as i64))?;
         let map_len = ((span + 0xfff) & !0xfff) as u64;
-        let virt_base = platform::memory::map(
-            0,
-            map_len,
-            syscall::MEMORY_ACCESS_READ | syscall::MEMORY_ACCESS_WRITE,
-            0,
-            0,
-        )?;
+        // MapPhysicalRange requires vacant pages. Reserving anonymous RAM here
+        // would make the subsequent borrowed MMIO mapping fail AlreadyExists.
+        let virt_base = mmio_address::take(map_len)
+            .ok_or_else(|| syscall::SysError::from_raw(syscall::ENOMEM as i64))?;
         platform::memory::map_physical_range(virt_base, page_base, map_len)?;
         Ok(Self {
             virt_base: virt_base as usize + page_offset,

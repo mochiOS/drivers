@@ -212,19 +212,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e13084392c5e4bc371903e2935a5eaeed24905a7511356b883835e18a78f6879"
 
 [[patch.unused]]
+name = "libc"
+version = "0.2.190"
+
+[[patch.unused]]
 name = "mnu"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "viewkit"
-version = "2.0.0"
-
-[[patch.unused]]
-name = "bootui"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "mochios-fonts"
 version = "0.1.0"
 
 [[patch.unused]]
@@ -234,6 +226,18 @@ version = "0.2.190"
 [[patch.unused]]
 name = "viewkit"
 version = "2.0.0"
+
+[[patch.unused]]
+name = "viewkit"
+version = "2.0.0"
+
+[[patch.unused]]
+name = "mboot-protocol"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-fonts"
+version = "0.1.0"
 
 [[patch.unused]]
 name = "mochios-filesystem-protocol"
@@ -284,9 +288,5 @@ name = "mochios-virtio-gpu-protocol"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "libc"
-version = "0.2.190"
-
-[[patch.unused]]
-name = "mboot-protocol"
+name = "bootui"
 version = "0.1.0"
