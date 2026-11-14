@@ -60,7 +60,6 @@ version = "0.1.0"
 [[package]]
 name = "plugkit"
 version = "0.1.0"
-source = "git+https://github.com/mochiOS/mnu#a5dc118db84c4a303ac74457c0feb78f4cd6dcba"
 dependencies = [
  "plugkit-macros",
  "plugkit-sys",
@@ -69,12 +68,10 @@ dependencies = [
 [[package]]
 name = "plugkit-macros"
 version = "0.1.0"
-source = "git+https://github.com/mochiOS/mnu#a5dc118db84c4a303ac74457c0feb78f4cd6dcba"
 
 [[package]]
 name = "plugkit-sys"
 version = "0.1.0"
-source = "git+https://github.com/mochiOS/mnu#a5dc118db84c4a303ac74457c0feb78f4cd6dcba"
 dependencies = [
  "spin",
 ]
@@ -212,11 +209,83 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e13084392c5e4bc371903e2935a5eaeed24905a7511356b883835e18a78f6879"
 
 [[patch.unused]]
-name = "mboot-protocol"
+name = "libc"
+version = "0.2.190"
+
+[[patch.unused]]
+name = "mochios-mdriver-protocol"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "viewkit"
+version = "2.0.0"
+
+[[patch.unused]]
+name = "viewkit"
+version = "2.0.0"
+
+[[patch.unused]]
+name = "mnu"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-appcore"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-device-consent"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-file-publication"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-linker-driver"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "ext4plus"
+version = "0.1.0-rc.2"
+
+[[patch.unused]]
+name = "libc"
+version = "0.2.190"
+
+[[patch.unused]]
+name = "bootui"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochi-user-newlib-runtime"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-certificate"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-certificate-database"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-driver-control-protocol"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-elf-signature"
 version = "0.1.0"
 
 [[patch.unused]]
 name = "mochios-filesystem-protocol"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-http-client"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-keychain-protocol"
 version = "0.1.0"
 
 [[patch.unused]]
@@ -232,6 +301,18 @@ name = "mochios-net-device-protocol"
 version = "0.1.0"
 
 [[patch.unused]]
+name = "mochios-network-stack"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-package-client"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-package-protocol"
+version = "0.1.0"
+
+[[patch.unused]]
 name = "mochios-posix-client"
 version = "0.1.0"
 
@@ -244,7 +325,15 @@ name = "mochios-signature-protocol"
 version = "0.1.0"
 
 [[patch.unused]]
+name = "mochios-test-support"
+version = "0.1.0"
+
+[[patch.unused]]
 name = "mochios-tls-client"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-tls-stream-ffi"
 version = "0.1.0"
 
 [[patch.unused]]
@@ -264,29 +353,21 @@ name = "mochios-virtio-gpu-protocol"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "viewkit"
-version = "2.0.0"
+name = "mochios-boot-selection"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-mdriver-protocol"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-system-image"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mboot-protocol"
+version = "0.1.0"
 
 [[patch.unused]]
 name = "mochios-fonts"
 version = "0.1.0"
-
-[[patch.unused]]
-name = "bootui"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "mnu"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "libc"
-version = "0.2.190"
-
-[[patch.unused]]
-name = "libc"
-version = "0.2.190"
-
-[[patch.unused]]
-name = "viewkit"
-version = "2.0.0"
