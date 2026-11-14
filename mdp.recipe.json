@@ -1,0 +1,95 @@
+{
+  "format": 1,
+  "steps": [
+    "mkdir -p $(MMAKE_OUT)/components",
+    "toolchain=`sed -n 's/^KERNEL_RUST_TOOLCHAIN=//p' $(ROOT)/.config | tr -d '\"' | tail -n1`; if grep -qx 'DRIVER_XHCI=y' $(ROOT)/.config; then cargo \"+$toolchain\" build --offline -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --release --target $(ROOT)/services/core/x86_64-unknown-mochios.json --target-dir $(OUT)/services-build/target --config \"patch.\\\"https://github.com/mochiOS/mnu\\\".mnu-abi.path='$(ROOT)/core/crates/abi'\" --config \"patch.\\\"https://github.com/mochiOS/syscalls\\\".mochi-user-platform.path='$(ROOT)/user/crates/platform'\" --config \"patch.\\\"https://github.com/mochiOS/syscalls\\\".mochi-user-runtime.path='$(ROOT)/user/crates/runtime'\" --config \"patch.\\\"https://github.com/mochiOS/syscalls\\\".mochi-user-syscall.path='$(ROOT)/user/crates/syscall'\" --config \"patch.\\\"https://github.com/mochiOS/syscalls\\\".mochios-capability-protocol.path='$(ROOT)/user/crates/capability-protocol'\" --manifest-path $(PROJECT)/usb-driver/Cargo.toml -p usb-driver --bin entry; fi",
+    "toolchain=`sed -n 's/^KERNEL_RUST_TOOLCHAIN=//p' $(ROOT)/.config | tr -d '\"' | tail -n1`; if grep -qx 'DRIVER_I8042=y' $(ROOT)/.config; then cargo \"+$toolchain\" build --offline -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --release --target $(ROOT)/services/core/x86_64-unknown-mochios.json --target-dir $(OUT)/services-build/target --config \"patch.\\\"https://github.com/mochiOS/mnu\\\".mnu-abi.path='$(ROOT)/core/crates/abi'\" --config \"patch.\\\"https://github.com/mochiOS/syscalls\\\".mochi-user-platform.path='$(ROOT)/user/crates/platform'\" --config \"patch.\\\"https://github.com/mochiOS/syscalls\\\".mochi-user-runtime.path='$(ROOT)/user/crates/runtime'\" --config \"patch.\\\"https://github.com/mochiOS/syscalls\\\".mochi-user-syscall.path='$(ROOT)/user/crates/syscall'\" --config \"patch.\\\"https://github.com/mochiOS/syscalls\\\".mochios-capability-protocol.path='$(ROOT)/user/crates/capability-protocol'\" --manifest-path $(PROJECT)/ps2/i8042-driver/Cargo.toml -p i8042-driver --bin i8042-entry; fi",
+    "toolchain=`sed -n 's/^KERNEL_RUST_TOOLCHAIN=//p' $(ROOT)/.config | tr -d '\"' | tail -n1`; if grep -qx 'DRIVER_VIRTIO_NET=y' $(ROOT)/.config; then cargo \"+$toolchain\" build --offline -Z build-std=core,alloc,compiler_builtins -Z json-target-spec --release --target $(ROOT)/services/core/x86_64-unknown-mochios.json --target-dir $(OUT)/services-build/target --config \"patch.\\\"https://github.com/mochiOS/mnu\\\".mnu-abi.path='$(ROOT)/core/crates/abi'\" --config \"patch.\\\"https://github.com/mochiOS/syscalls\\\".mochi-user-platform.path='$(ROOT)/user/crates/platform'\" --config \"patch.\\\"https://github.com/mochiOS/syscalls\\\".mochi-user-runtime.path='$(ROOT)/user/crates/runtime'\" --config \"patch.\\\"https://github.com/mochiOS/syscalls\\\".mochi-user-syscall.path='$(ROOT)/user/crates/syscall'\" --config \"patch.\\\"https://github.com/mochiOS/syscalls\\\".mochios-capability-protocol.path='$(ROOT)/user/crates/capability-protocol'\" --manifest-path $(PROJECT)/virtio-net-driver/Cargo.toml -p virtio-net-driver --bin virtio-net-driver; fi",
+    "touch $(MMAKE_OUT)/components/drivers.stamp"
+  ],
+  "package": {
+    "name": "drivers",
+    "version": "0.1.0",
+    "target": "x86_64-mochios",
+    "abi": "mochios-1"
+  },
+  "artifact": "out/mdp/drivers.tar.mdp",
+  "exports": [
+    {
+      "source": "$(ROOT)/out/services-build/target/x86_64-unknown-mochios/release/entry",
+      "area": "system",
+      "destination": "bin/drivers/usb/qemu-usb.driver/entry.elf",
+      "mode": 493,
+      "when": {
+        "DRIVER_XHCI": "y"
+      }
+    },
+    {
+      "source": "usb-driver/manifest.toml",
+      "area": "manifests",
+      "destination": "drivers/usb/qemu-usb.driver.toml",
+      "when": {
+        "DRIVER_XHCI": "y"
+      }
+    },
+    {
+      "source": "$(ROOT)/out/services-build/target/x86_64-unknown-mochios/release/i8042-entry",
+      "area": "system",
+      "destination": "bin/drivers/ps2/i8042.driver/entry.elf",
+      "mode": 493,
+      "when": {
+        "DRIVER_I8042": "y"
+      }
+    },
+    {
+      "source": "ps2/i8042-driver/manifest.toml",
+      "area": "manifests",
+      "destination": "drivers/ps2/i8042.driver.toml",
+      "when": {
+        "DRIVER_I8042": "y"
+      }
+    },
+    {
+      "source": "$(ROOT)/out/services-build/target/x86_64-unknown-mochios/release/virtio-net-driver",
+      "area": "system",
+      "destination": "bin/drivers/network/virtio-net.driver/virtio-net.driver",
+      "mode": 493,
+      "when": {
+        "DRIVER_VIRTIO_NET": "y"
+      }
+    },
+    {
+      "source": "virtio-net-driver/manifest.toml",
+      "area": "manifests",
+      "destination": "drivers/network/virtio-net.driver.toml",
+      "when": {
+        "DRIVER_VIRTIO_NET": "y"
+      }
+    }
+  ],
+  "metadata": {
+    "builtins": [
+      {
+        "manifest": "drivers/usb/qemu-usb.driver.toml",
+        "directory": "drivers/usb/qemu-usb.driver",
+        "when": {
+          "DRIVER_XHCI": "y"
+        }
+      },
+      {
+        "manifest": "drivers/ps2/i8042.driver.toml",
+        "directory": "drivers/ps2/i8042.driver",
+        "when": {
+          "DRIVER_I8042": "y"
+        }
+      },
+      {
+        "manifest": "drivers/network/virtio-net.driver.toml",
+        "directory": "drivers/network/virtio-net.driver",
+        "when": {
+          "DRIVER_VIRTIO_NET": "y"
+        }
+      }
+    ]
+  }
+}
