@@ -4,6 +4,7 @@ extern crate alloc;
 
 mod pci_bar;
 mod mmio_address;
+mod ring_state;
 
 use alloc::format;
 use core::mem::size_of;
@@ -11,6 +12,13 @@ use core::ptr::{read_volatile, write_volatile};
 use mochi_user_platform as platform;
 use mochi_user_syscall as syscall;
 use plugkit::prelude::*;
+
+// Native drivers have no stdout; keep controller failures visible in release.
+macro_rules! driver_status {
+    ($($arg:tt)*) => {{
+        let _ = platform::logger::write_status_fmt(format_args!("{}\n", format_args!($($arg)*)));
+    }};
+}
 
 const XHCI_PROG_IF: u8 = 0x30;
 
@@ -103,7 +111,7 @@ struct ConfigureEndpointCtx<'a> {
     rtsoff: usize,
     command_ring: &'a DmaPage,
     ring_state: &'a mut CommandRingState,
-    event_ring: &'a DmaPage,
+    event_ring: &'a EventRing,
     output_ctx: &'a DmaPage,
     input_ctx: &'a DmaPage,
     slot_id: u8,
@@ -216,15 +224,8 @@ struct DmaPage {
     len: usize,
 }
 
-struct CommandRingState {
-    next_index: usize,
-    cycle: u32,
-}
-
-static mut XHCI_COMMAND_RING_STATE: CommandRingState = CommandRingState {
-    next_index: 0,
-    cycle: XHCI_TRB_CYCLE,
-};
+type CommandRingState = ring_state::Cursor;
+static mut XHCI_COMMAND_RING_STATE: CommandRingState = CommandRingState::new();
 static mut XHCI_DOORBELL_BASE: usize = 0;
 
 impl DmaPage {
@@ -290,9 +291,31 @@ struct Trb {
     control: u32,
 }
 
-struct TransferRingState {
-    next_index: usize,
-    cycle: u32,
+type TransferRingState = ring_state::Cursor;
+
+struct EventRing {
+    memory: DmaPage,
+    cursor: core::cell::Cell<ring_state::Cursor>,
+}
+impl core::ops::Deref for EventRing {
+    type Target = DmaPage;
+    fn deref(&self) -> &DmaPage { &self.memory }
+}
+impl EventRing {
+    fn pop(&self, mmio: &MmioRegion, rtsoff: usize) -> Option<Trb> {
+        let mut cursor = self.cursor.get();
+        let offset = cursor.next_index * size_of::<Trb>();
+        let control = self.read_u32(offset + 12);
+        if !cursor.owns(control) { return None; }
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        let event = Trb { parameter: 0, status: self.read_u32(offset + 8), control };
+        cursor.advance(self.len / size_of::<Trb>());
+        self.cursor.set(cursor);
+        // Return ownership via ERDP; never clear controller-owned cycle bits.
+        mmio.write_u64(rtsoff + XHCI_RT_IR0 + XHCI_IR_ERDP,
+            self.phys + (cursor.next_index * size_of::<Trb>()) as u64 | (1 << 3));
+        Some(event)
+    }
 }
 
 fn wait_until(label: &str, limit: usize, mut pred: impl FnMut() -> bool) -> bool {
@@ -376,7 +399,11 @@ fn queue_command_trb(
     command_ring.write_u64(offset, parameter);
     command_ring.write_u32(offset + 8, status);
     command_ring.write_u32(offset + 12, control | state.cycle);
-    state.next_index += 1;
+    if state.next_index == trb_count - 2 {
+        let link = (trb_count - 1) * size_of::<Trb>();
+        command_ring.write_u32(link + 12, (XHCI_TRB_TYPE_LINK << 10) | XHCI_TRB_TC | state.cycle);
+    }
+    state.advance(trb_count - 1);
 }
 
 fn queue_transfer_trb(
@@ -392,117 +419,55 @@ fn queue_transfer_trb(
     transfer_ring.write_u64(offset, parameter);
     transfer_ring.write_u32(offset + 8, status);
     transfer_ring.write_u32(offset + 12, control | state.cycle);
-    state.next_index += 1;
-}
-
-fn clear_event_trbs(event_ring: &DmaPage) {
-    let trb_size = size_of::<Trb>();
-    let event_count = event_ring.len / trb_size;
-    for idx in 0..event_count {
-        event_ring.write_u32(idx * trb_size + 12, 0);
+    if state.next_index == trb_count - 2 {
+        let link = (trb_count - 1) * size_of::<Trb>();
+        transfer_ring.write_u32(link + 12, (XHCI_TRB_TYPE_LINK << 10) | XHCI_TRB_TC | state.cycle);
     }
+    state.advance(trb_count - 1);
 }
 
 fn wait_command_completion(
-    mmio: &MmioRegion,
-    rtsoff: usize,
-    event_ring: &DmaPage,
-    expected_type: u32,
+    mmio: &MmioRegion, rtsoff: usize, event_ring: &EventRing, expected_type: u32,
 ) -> Option<(u32, u8)> {
-    let trb_size = size_of::<Trb>();
-    let event_count = event_ring.len / trb_size;
+    let mut completion = None;
     wait_until("command completion", 100_000, || {
-        for idx in 0..event_count {
-            let control = event_ring.read_u32(idx * trb_size + 12);
-            if (control & XHCI_TRB_CYCLE) != 0 {
+        while let Some(event) = event_ring.pop(mmio, rtsoff) {
+            if (event.control >> 10) & 0x3f == expected_type {
+                completion = Some((event.status >> 24, (event.control >> 24) as u8));
                 return true;
             }
         }
         false
     });
+    completion
+}
 
+fn poll_transfer_status(
+    mmio: &MmioRegion, rtsoff: usize, event_ring: &EventRing, slot_id: u8,
+) -> Option<u32> {
+    while let Some(event) = event_ring.pop(mmio, rtsoff) {
+        if (event.control >> 10) & 0x3f == XHCI_TRB_TYPE_TRANSFER_EVENT
+            && (event.control >> 24) as u8 == slot_id {
+            return Some(event.status);
+        }
+    }
+    None
+}
+fn wait_transfer_status(
+    mmio: &MmioRegion, rtsoff: usize, event_ring: &EventRing, slot_id: u8,
+) -> Option<u32> {
     let mut completion = None;
-    let mut consumed = 0usize;
-    for idx in 0..event_count {
-        let offset = idx * trb_size;
-        let control = event_ring.read_u32(offset + 12);
-        if (control & XHCI_TRB_CYCLE) == 0 {
-            continue;
-        }
-        consumed = idx + 1;
-        let trb_type = (control >> 10) & 0x3f;
-        if trb_type == expected_type {
-            let status = event_ring.read_u32(offset + 8);
-            let completion_code = (status >> 24) & 0xff;
-            let slot_id = ((control >> 24) & 0xff) as u8;
-            completion = Some((completion_code, slot_id));
-        }
-        event_ring.write_u32(offset + 12, 0);
-    }
-
-    if consumed != 0 {
-        let next_offset = if consumed >= event_count {
-            0
-        } else {
-            consumed * trb_size
-        };
-        let ir0 = rtsoff + XHCI_RT_IR0;
-        mmio.write_u64(ir0 + XHCI_IR_ERDP, event_ring.phys + next_offset as u64);
-    }
-
+    wait_until("transfer event", 500, || {
+        completion = poll_transfer_status(mmio, rtsoff, event_ring, slot_id);
+        completion.is_some()
+    });
     completion
 }
 
 fn wait_transfer_event(
-    mmio: &MmioRegion,
-    rtsoff: usize,
-    event_ring: &DmaPage,
-    slot_id: u8,
+    mmio: &MmioRegion, rtsoff: usize, event_ring: &EventRing, slot_id: u8,
 ) -> Option<u32> {
-    let trb_size = size_of::<Trb>();
-    let event_count = event_ring.len / trb_size;
-    let ready = wait_until("transfer event", 500, || {
-        for idx in 0..event_count {
-            let control = event_ring.read_u32(idx * trb_size + 12);
-            if (control & XHCI_TRB_CYCLE) != 0 {
-                return true;
-            }
-        }
-        false
-    });
-    if !ready {
-        let _ = slot_id;
-        return None;
-    }
-    let mut completion = None;
-    let mut consumed = 0usize;
-    for idx in 0..event_count {
-        let offset = idx * trb_size;
-        let control = event_ring.read_u32(offset + 12);
-        if (control & XHCI_TRB_CYCLE) == 0 {
-            continue;
-        }
-        consumed = idx + 1;
-        let trb_type = (control >> 10) & 0x3f;
-        let event_slot_id = ((control >> 24) & 0xff) as u8;
-        if trb_type == XHCI_TRB_TYPE_TRANSFER_EVENT && event_slot_id == slot_id {
-            let status = event_ring.read_u32(offset + 8);
-            completion = Some((status >> 24) & 0xff);
-        }
-        event_ring.write_u32(offset + 12, 0);
-    }
-
-    if consumed != 0 {
-        let next_offset = if consumed >= event_count {
-            0
-        } else {
-            consumed * trb_size
-        };
-        let ir0 = rtsoff + XHCI_RT_IR0;
-        mmio.write_u64(ir0 + XHCI_IR_ERDP, event_ring.phys + next_offset as u64);
-    }
-
-    completion
+    wait_transfer_status(mmio, rtsoff, event_ring, slot_id).map(|status| status >> 24)
 }
 
 fn enable_slot(
@@ -511,7 +476,7 @@ fn enable_slot(
     rtsoff: usize,
     command_ring: &DmaPage,
     ring_state: &mut CommandRingState,
-    event_ring: &DmaPage,
+    event_ring: &EventRing,
 ) -> Option<u8> {
     queue_command_trb(
         command_ring,
@@ -526,7 +491,7 @@ fn enable_slot(
     let (completion, slot_id) =
         wait_command_completion(mmio, rtsoff, event_ring, XHCI_TRB_TYPE_COMMAND_COMPLETION)?;
     if completion != XHCI_CC_SUCCESS || slot_id == 0 {
-        platform::println!(
+        driver_status!(
             "usb-driver: enable slot failed completion={} slot_id={}",
             completion,
             slot_id
@@ -623,7 +588,7 @@ fn address_device(
     rtsoff: usize,
     command_ring: &DmaPage,
     ring_state: &mut CommandRingState,
-    event_ring: &DmaPage,
+    event_ring: &EventRing,
     input_ctx: &DmaPage,
     slot_id: u8,
 ) -> bool {
@@ -643,7 +608,7 @@ fn address_device(
         return false;
     };
     if completion != XHCI_CC_SUCCESS || completed_slot_id != slot_id {
-        platform::println!(
+        driver_status!(
             "usb-driver: address device failed completion={} slot_id={}",
             completion,
             completed_slot_id
@@ -735,16 +700,21 @@ fn configure_interrupt_in_endpoint(
         32usize
     };
     let slot_ctx = context_size;
-    let ep1_in_ctx = context_size * 3;
+    let (dci, ep1_in_ctx) = ring_state::endpoint_context(context_size, ep.address);
     let interval = ep.interval.saturating_sub(1).min(15) as u32;
 
-    ctx.input_ctx.copy_from(ctx.output_ctx);
+    ctx.input_ctx.zero();
+    // Output Context starts with Slot Context; Input Context starts with the
+    // extra Input Control Context. Copy the slot to its corresponding offset.
+    for offset in (0..context_size).step_by(4) {
+        ctx.input_ctx.write_u32(slot_ctx + offset, ctx.output_ctx.read_u32(offset));
+    }
     ctx.input_ctx.write_u32(XHCI_INPUT_CONTROL_DROP_FLAGS, 0);
-    ctx.input_ctx.write_u32(XHCI_INPUT_CONTROL_ADD_FLAGS, 0x9);
+    ctx.input_ctx.write_u32(XHCI_INPUT_CONTROL_ADD_FLAGS, 1 | (1 << dci));
     ctx.input_ctx.write_u32(XHCI_INPUT_CONTROL_CONFIG_VALUE, 0);
     ctx.input_ctx.write_u32(
         slot_ctx + XHCI_SLOT_CTX_DW0,
-        ((ctx.speed_id & 0xF) << 20) | (3 << 27),
+        (ctx.input_ctx.read_u32(slot_ctx + XHCI_SLOT_CTX_DW0) & !(31 << 27)) | (dci << 27),
     );
     ctx.input_ctx
         .write_u32(slot_ctx + XHCI_SLOT_CTX_DW1, (ctx.root_port as u32) << 16);
@@ -778,7 +748,7 @@ fn configure_interrupt_in_endpoint(
         XHCI_TRB_TYPE_COMMAND_COMPLETION,
     )?;
     if completion != XHCI_CC_SUCCESS || completed_slot_id != ctx.slot_id {
-        platform::println!(
+        driver_status!(
             "usb-driver: configure endpoint failed completion={} slot_id={}",
             completion,
             completed_slot_id
@@ -796,49 +766,35 @@ fn configure_interrupt_in_endpoint(
 }
 
 fn queue_interrupt_in_transfer(
-    mmio: &MmioRegion,
-    rtsoff: usize,
-    event_ring: &DmaPage,
-    slot_id: u8,
-    ep1_ring: &DmaPage,
-    ring_state: &mut TransferRingState,
-    ep: InterruptEndpointInfo,
-) -> Option<DmaPage> {
-    let report = DmaPage::allocate(4096).ok()?;
-    let dci = endpoint_dci(ep.address);
-    for attempt in 0..16 {
-        report.zero();
-        clear_event_trbs(event_ring);
-        queue_transfer_trb(
-            ep1_ring,
-            ring_state,
-            report.phys,
-            ep.max_packet as u32,
-            (XHCI_TRB_TYPE_NORMAL << 10) | XHCI_TRB_ISP | XHCI_TRB_IOC,
-        );
-        let doorbell_base = current_doorbell_base();
-        let dbell_value = doorbell_value(dci, 0);
-        unsafe { write_doorbell(doorbell_base, slot_id as u32, dbell_value) };
-        let Some(completion) = wait_transfer_event(mmio, rtsoff, event_ring, slot_id) else {
-            continue;
-        };
-        if completion == XHCI_CC_SUCCESS {
-            return Some(report);
+    mmio: &MmioRegion, rtsoff: usize, event_ring: &EventRing, slot_id: u8,
+    ep1_ring: &DmaPage, ring_state: &mut TransferRingState,
+    ep: InterruptEndpointInfo, report: &DmaPage,
+) -> Option<usize> {
+    report.zero();
+    queue_transfer_trb(ep1_ring, ring_state, report.phys, ep.max_packet as u32,
+        (XHCI_TRB_TYPE_NORMAL << 10) | XHCI_TRB_ISP | XHCI_TRB_IOC);
+    unsafe { write_doorbell(current_doorbell_base(), slot_id as u32, doorbell_value(endpoint_dci(ep.address), 0)) };
+    // An idle HID endpoint NAKs until the user moves. Keep exactly one DMA
+    // buffer/TD outstanding instead of filling the ring with timeout retries.
+    loop {
+        if let Some(status) = poll_transfer_status(mmio, rtsoff, event_ring, slot_id) {
+            return ring_state::received_length(status, ep.max_packet as usize);
         }
+        // Polling is temporary until this backend subscribes to IRQ delivery;
+        // an idle mouse must not occupy a vCPU with repeated yield syscalls.
+        let _ = platform::thread::sleep_milliseconds(1);
     }
-    None
 }
 
 fn hid_set_idle(
     mmio: &MmioRegion,
     rtsoff: usize,
-    event_ring: &DmaPage,
+    event_ring: &EventRing,
     slot_id: u8,
     ep0_ring: &DmaPage,
     ring_state: &mut TransferRingState,
     interface_number: u8,
 ) -> bool {
-    clear_event_trbs(event_ring);
     queue_control_no_data(
         ep0_ring,
         ring_state,
@@ -859,14 +815,13 @@ fn hid_set_idle(
 fn hid_set_protocol(
     mmio: &MmioRegion,
     rtsoff: usize,
-    event_ring: &DmaPage,
+    event_ring: &EventRing,
     slot_id: u8,
     ep0_ring: &DmaPage,
     ring_state: &mut TransferRingState,
     interface_number: u8,
     protocol: u16,
 ) -> bool {
-    clear_event_trbs(event_ring);
     queue_control_no_data(
         ep0_ring,
         ring_state,
@@ -929,8 +884,7 @@ fn input_service_tid() -> u64 {
         .unwrap_or(0)
 }
 
-fn send_hid_input_report(input_tid: &mut u64, report: &DmaPage, ep: InterruptEndpointInfo) {
-    let packet_len = core::cmp::min(ep.max_packet as usize, report.len);
+fn send_hid_input_report(input_tid: &mut u64, report: &DmaPage, packet_len: usize) {
     if packet_len < 5 {
         return;
     }
@@ -966,20 +920,19 @@ fn read_device_descriptor(
     mmio: &MmioRegion,
     dboff: usize,
     rtsoff: usize,
-    event_ring: &DmaPage,
+    event_ring: &EventRing,
     slot_id: u8,
     ep0_ring: &DmaPage,
     ring_state: &mut TransferRingState,
 ) -> Option<(u16, u16)> {
     let descriptor = allocate_descriptor_page()?;
-    clear_event_trbs(event_ring);
     queue_descriptor_read(ep0_ring, ring_state, &descriptor, USB_DESC_TYPE_DEVICE, 18);
     let doorbell_base = current_doorbell_base();
     let dbell_value = doorbell_value(1, 0);
     unsafe { write_doorbell(doorbell_base, slot_id as u32, dbell_value) };
     let completion = wait_transfer_event(mmio, rtsoff, event_ring, slot_id)?;
     if completion != XHCI_CC_SUCCESS {
-        platform::println!(
+        driver_status!(
             "usb-driver: get device descriptor transfer failed completion={}",
             completion
         );
@@ -995,7 +948,7 @@ fn read_report_descriptor(
     mmio: &MmioRegion,
     dboff: usize,
     rtsoff: usize,
-    event_ring: &DmaPage,
+    event_ring: &EventRing,
     slot_id: u8,
     ep0_ring: &DmaPage,
     ring_state: &mut TransferRingState,
@@ -1007,7 +960,6 @@ fn read_report_descriptor(
         None => return false,
     };
     let transfer_length = report_len.min(descriptor.len as u16);
-    clear_event_trbs(event_ring);
     queue_transfer_trb(
         ep0_ring,
         ring_state,
@@ -1042,7 +994,7 @@ fn read_report_descriptor(
         return false;
     };
     if completion != XHCI_CC_SUCCESS {
-        platform::println!(
+        driver_status!(
             "usb-driver: get report descriptor failed completion={}",
             completion
         );
@@ -1063,7 +1015,7 @@ fn read_report_descriptor(
         line[i * 3 + 2] = if i + 1 == preview_len { 0 } else { b' ' };
     }
     if let Ok(text) = core::str::from_utf8(&line[..preview_len * 3 - 1]) {
-        platform::println!("usb-driver: report descriptor bytes={}", text);
+        driver_status!("usb-driver: report descriptor bytes={}", text);
     }
     true
 }
@@ -1072,7 +1024,7 @@ fn read_configuration_descriptor(
     mmio: &MmioRegion,
     dboff: usize,
     rtsoff: usize,
-    event_ring: &DmaPage,
+    event_ring: &EventRing,
     slot_id: u8,
     ep0_ring: &DmaPage,
     ring_state: &mut TransferRingState,
@@ -1082,7 +1034,6 @@ fn read_configuration_descriptor(
         None => return None,
     };
 
-    clear_event_trbs(event_ring);
     queue_descriptor_read(
         ep0_ring,
         ring_state,
@@ -1097,7 +1048,7 @@ fn read_configuration_descriptor(
         return None;
     };
     if completion != XHCI_CC_SUCCESS {
-        platform::println!(
+        driver_status!(
             "usb-driver: get config header failed completion={}",
             completion
         );
@@ -1107,7 +1058,6 @@ fn read_configuration_descriptor(
     let total_length = ((descriptor.read_u32(0) >> 16) & 0xffff) as u16;
     let transfer_length = total_length.min(descriptor.len as u16);
     descriptor.zero();
-    clear_event_trbs(event_ring);
     queue_descriptor_read(
         ep0_ring,
         ring_state,
@@ -1122,7 +1072,7 @@ fn read_configuration_descriptor(
         return None;
     };
     if completion != XHCI_CC_SUCCESS {
-        platform::println!(
+        driver_status!(
             "usb-driver: get config descriptor failed completion={}",
             completion
         );
@@ -1208,13 +1158,12 @@ fn set_configuration(
     mmio: &MmioRegion,
     dboff: usize,
     rtsoff: usize,
-    event_ring: &DmaPage,
+    event_ring: &EventRing,
     slot_id: u8,
     ep0_ring: &DmaPage,
     ring_state: &mut TransferRingState,
     config_value: u8,
 ) -> bool {
-    clear_event_trbs(event_ring);
     queue_control_no_data(ep0_ring, ring_state, 0x00, 0x09, config_value as u16, 0);
     let doorbell_base = current_doorbell_base();
     let dbell_value = doorbell_value(1, 0);
@@ -1223,7 +1172,7 @@ fn set_configuration(
         return false;
     };
     if completion != XHCI_CC_SUCCESS {
-        platform::println!(
+        driver_status!(
             "usb-driver: set configuration failed completion={} value={}",
             completion,
             config_value
@@ -1249,7 +1198,7 @@ fn reset_port(mmio: &MmioRegion, port_offset: usize, port_index: usize) -> Optio
             let value = mmio.read_u32(port_offset);
             (value & XHCI_PORTSC_PR) == 0 && (value & XHCI_PORTSC_PED) != 0
         }) {
-            platform::println!("usb-driver: port{} reset failed", port_index + 1);
+            driver_status!("usb-driver: port{} reset failed", port_index + 1);
             return None;
         }
     }
@@ -1410,7 +1359,7 @@ fn enumerate_xhci_controller(loc: PciLocation, bar: XhciBar, vendor: u16, device
     let pagesize = mmio.read_u32(cap_length + XHCI_OP_PAGESIZE);
     let config = mmio.read_u32(cap_length + XHCI_OP_CONFIG);
 
-    platform::println!(
+    driver_status!(
         "usb-driver: PCI USB controller bus={:02x} dev={:02x} func={} vendor=0x{:04x} device=0x{:04x} class=0x0c subclass=0x03 prog_if=0x{:02x} header=0x{:02x}",
         loc.bus,
         loc.device,
@@ -1420,7 +1369,7 @@ fn enumerate_xhci_controller(loc: PciLocation, bar: XhciBar, vendor: u16, device
         XHCI_PROG_IF,
         pci_read_u8(loc, 0x0E).unwrap_or(0),
     );
-    platform::println!(
+    driver_status!(
         "usb-driver: xhci controller bus={:02x} dev={:02x} func={} vendor=0x{:04x} device=0x{:04x} mmio_base=0x{:016x} mmio_size=0x{:x}",
         loc.bus,
         loc.device,
@@ -1430,7 +1379,7 @@ fn enumerate_xhci_controller(loc: PciLocation, bar: XhciBar, vendor: u16, device
         bar.phys_base,
         bar.size
     );
-    platform::println!(
+    driver_status!(
         "usb-driver: xhci caplen=0x{:02x} hci=0x{:04x} slots={} intrs={} ports={} hcc=0x{:08x} dboff=0x{:x} rtsoff=0x{:x}",
         cap_length,
         hci_version,
@@ -1448,28 +1397,28 @@ fn enumerate_xhci_controller(loc: PciLocation, bar: XhciBar, vendor: u16, device
     let dcbaa = match DmaPage::allocate(4096) {
         Ok(page) => page,
         Err(_) => {
-            platform::println!("usb-driver: xhci ring initialization failed");
+            driver_status!("usb-driver: xhci ring initialization failed");
             return;
         }
     };
     let command_ring = match DmaPage::allocate(4096) {
         Ok(page) => page,
         Err(_) => {
-            platform::println!("usb-driver: xhci ring initialization failed");
+            driver_status!("usb-driver: xhci ring initialization failed");
             return;
         }
     };
     let event_ring = match DmaPage::allocate(4096) {
-        Ok(page) => page,
+        Ok(memory) => EventRing { memory, cursor: core::cell::Cell::new(ring_state::Cursor::new()) },
         Err(_) => {
-            platform::println!("usb-driver: xhci ring initialization failed");
+            driver_status!("usb-driver: xhci ring initialization failed");
             return;
         }
     };
     let erst = match DmaPage::allocate(4096) {
         Ok(page) => page,
         Err(_) => {
-            platform::println!("usb-driver: xhci ring initialization failed");
+            driver_status!("usb-driver: xhci ring initialization failed");
             return;
         }
     };
@@ -1506,7 +1455,7 @@ fn enumerate_xhci_controller(loc: PciLocation, bar: XhciBar, vendor: u16, device
 
     let command_ring_state = core::ptr::addr_of_mut!(XHCI_COMMAND_RING_STATE);
     if !xhci_start(&mmio, cap_length) {
-        platform::println!("usb-driver: xhci start failed");
+        driver_status!("usb-driver: xhci start failed");
         return;
     }
     let mut selected_port = None;
@@ -1540,21 +1489,21 @@ fn enumerate_xhci_controller(loc: PciLocation, bar: XhciBar, vendor: u16, device
                 let output_ctx = match DmaPage::allocate(4096) {
                     Ok(page) => page,
                     Err(_) => {
-                        platform::println!("usb-driver: slot context initialization failed");
+                        driver_status!("usb-driver: slot context initialization failed");
                         return;
                     }
                 };
                 let input_ctx = match DmaPage::allocate(4096) {
                     Ok(page) => page,
                     Err(_) => {
-                        platform::println!("usb-driver: slot context initialization failed");
+                        driver_status!("usb-driver: slot context initialization failed");
                         return;
                     }
                 };
                 let ep0_ring = match DmaPage::allocate(4096) {
                     Ok(page) => page,
                     Err(_) => {
-                        platform::println!("usb-driver: slot context initialization failed");
+                        driver_status!("usb-driver: slot context initialization failed");
                         return;
                     }
                 };
@@ -1644,7 +1593,7 @@ fn enumerate_xhci_controller(loc: PciLocation, bar: XhciBar, vendor: u16, device
                         &ep0_ring,
                         &mut ep0_ring_state,
                     ) {
-                        platform::println!(
+                        driver_status!(
                             "usb-driver: device descriptor vendor=0x{:04x} product=0x{:04x}",
                             vendor_id,
                             product_id
@@ -1678,7 +1627,7 @@ fn enumerate_xhci_controller(loc: PciLocation, bar: XhciBar, vendor: u16, device
                                         &mut ep0_ring_state,
                                         config.interface_number,
                                     );
-                                    let protocol_ok = hid_set_protocol(
+                                    let protocol_ok = config.interface_subclass != 1 || hid_set_protocol(
                                         &mmio,
                                         rtsoff,
                                         &event_ring,
@@ -1706,9 +1655,11 @@ fn enumerate_xhci_controller(loc: PciLocation, bar: XhciBar, vendor: u16, device
                                             ep,
                                         )
                                     {
+                                        let Some(report) = DmaPage::allocate(4096).ok() else { return; };
                                         let mut input_tid = input_service_tid();
+                                        driver_status!("usb-driver: HID pointer ready endpoint={} input_handle={}", ep.address, input_tid);
                                         loop {
-                                            if let Some(report) = queue_interrupt_in_transfer(
+                                            if let Some(packet_len) = queue_interrupt_in_transfer(
                                                 &mmio,
                                                 rtsoff,
                                                 &event_ring,
@@ -1716,14 +1667,15 @@ fn enumerate_xhci_controller(loc: PciLocation, bar: XhciBar, vendor: u16, device
                                                 &ep1_ring,
                                                 &mut ep1_ring_state,
                                                 ep,
+                                                &report,
                                             ) {
                                                 log_hid_input_report(&report, ep);
-                                                send_hid_input_report(&mut input_tid, &report, ep);
+                                                send_hid_input_report(&mut input_tid, &report, packet_len);
                                             }
                                             platform::thread::yield_now();
                                         }
                                     } else {
-                                        platform::println!(
+                                        driver_status!(
                                             "usb-driver: configure interrupt endpoint failed"
                                         );
                                     }
@@ -1742,23 +1694,23 @@ fn enumerate_xhci_controller(loc: PciLocation, bar: XhciBar, vendor: u16, device
                                     );
                                 }
                             } else {
-                                platform::println!("usb-driver: set configuration failed");
+                                driver_status!("usb-driver: set configuration failed");
                             }
                         } else {
-                            platform::println!("usb-driver: configuration descriptor read failed");
+                            driver_status!("usb-driver: configuration descriptor read failed");
                         }
                     } else {
-                        platform::println!("usb-driver: device descriptor read failed");
+                        driver_status!("usb-driver: device descriptor read failed");
                     }
                 } else {
-                    platform::println!("usb-driver: address device timed out or failed");
+                    driver_status!("usb-driver: address device timed out or failed");
                 }
             }
         } else {
-            platform::println!("usb-driver: enable slot timed out or failed");
+            driver_status!("usb-driver: enable slot timed out or failed");
         }
     } else {
-        platform::println!("usb-driver: no enabled usb ports after reset");
+        driver_status!("usb-driver: no enabled usb ports after reset");
     }
 }
 
@@ -1830,7 +1782,7 @@ fn pci_scan() {
     }
 
     if found == 0 {
-        platform::println!("usb-driver: no xHCI USB controller found");
+        driver_status!("usb-driver: no xHCI USB controller found");
     }
 }
 
